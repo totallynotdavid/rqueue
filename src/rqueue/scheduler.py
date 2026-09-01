@@ -1,0 +1,301 @@
+"""Periodic schedules, fired through the occurrence-key table (§6).
+
+There is no leader election and no schedule-row claim. Each tick works out
+which occurrences are due, then tries to insert ``(schedule_id,
+occurrence_at)`` and the job it produces *in one transaction*. The unique
+constraint decides the winner between replicas, and a scheduler that dies
+mid-transaction leaves nothing behind, so the next tick retries the same
+occurrence. That is the whole mechanism.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import logging
+import uuid
+from collections.abc import Sequence
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
+from typing import Any, Final
+
+import asyncpg
+
+from rqueue.cron import CronExpression, resolve_timezone
+from rqueue.errors import ValidationError
+from rqueue.limits import (
+    MAX_CONCURRENCY_KEY_LENGTH,
+    MAX_QUEUE_NAME_LENGTH,
+    MAX_SCHEDULE_NAME_LENGTH,
+    MAX_TASK_NAME_LENGTH,
+    MAX_WORKER_ID_LENGTH,
+    validate_key,
+    validate_max_attempts,
+    validate_name,
+    validate_payload,
+    validate_priority,
+)
+from rqueue.metrics import MetricsSink, NullMetricsSink
+from rqueue.models import Job, JobRequest, Schedule
+from rqueue.queue import Queue
+
+__all__ = ["ScheduleSpec", "Scheduler"]
+
+_LOGGER: Final = logging.getLogger("rqueue.scheduler")
+
+_DB_ERRORS: Final = (asyncpg.PostgresError, asyncpg.InterfaceError, OSError)
+
+
+@dataclass(frozen=True, slots=True)
+class ScheduleSpec:
+    """A periodic schedule declared in code and synced to the database."""
+
+    name: str
+    task: str
+    cron: str
+    payload: Any = None
+    timezone: str = "UTC"
+    queue: str | None = None
+    enabled: bool = True
+    priority: int = 0
+    max_attempts: int = 3
+    concurrency_key: str | None = None
+
+    def __post_init__(self) -> None:
+        validate_name(
+            self.name, kind="schedule name", max_length=MAX_SCHEDULE_NAME_LENGTH
+        )
+        validate_name(self.task, kind="task name", max_length=MAX_TASK_NAME_LENGTH)
+        CronExpression.parse(self.cron)
+        resolve_timezone(self.timezone)
+        validate_priority(self.priority)
+        validate_max_attempts(self.max_attempts)
+        validate_key(
+            self.concurrency_key,
+            kind="concurrency_key",
+            max_length=MAX_CONCURRENCY_KEY_LENGTH,
+        )
+        if self.queue is not None:
+            validate_name(
+                self.queue, kind="queue name", max_length=MAX_QUEUE_NAME_LENGTH
+            )
+
+
+class Scheduler:
+    """Emits durable job occurrences for the enabled schedules.
+
+    Safe to run on several replicas at once: they contend on the occurrence key
+    and exactly one wins each occurrence.
+
+    A tick considers *every* enabled schedule in the schema, not only those
+    targeting this handle's queue -- a scheduler only enqueues, so one
+    deployment can serve several queues. The :class:`~rqueue.Queue` it is built
+    from supplies the pool, the schema, and the default queue for schedules
+    that do not name one.
+    """
+
+    def __init__(
+        self,
+        queue: Queue,
+        *,
+        scheduler_id: str,
+        schedules: Sequence[ScheduleSpec] = (),
+        interval: float = 10.0,
+        catchup: int = 1,
+        metrics: MetricsSink | None = None,
+        logger: logging.Logger | None = None,
+    ) -> None:
+        self.queue = queue
+        self.scheduler_id = validate_name(
+            scheduler_id, kind="scheduler_id", max_length=MAX_WORKER_ID_LENGTH
+        )
+        self.schedules = tuple(schedules)
+        if interval <= 0:
+            raise ValidationError("scheduler interval must be positive")
+        self.interval = float(interval)
+        if catchup < 1:
+            raise ValidationError("catchup must be at least 1")
+        #: How many missed occurrences one tick will fire after an outage. The
+        #: default of 1 collapses a long outage into a single catch-up run,
+        #: which is what a maintenance job almost always wants; raise it when
+        #: every individual occurrence genuinely matters.
+        self.catchup = catchup
+        self.metrics: MetricsSink = metrics or NullMetricsSink()
+        self.logger = logger or _LOGGER
+        self._storage = queue.storage
+        self._stop = asyncio.Event()
+
+    # ------------------------------------------------------------- lifecycle
+
+    async def run(self) -> None:
+        """Sync declared schedules, then fire due occurrences until stopped."""
+        self._stop.clear()
+        await self.sync()
+        while not self._stop.is_set():
+            try:
+                await self.tick()
+            except _DB_ERRORS:
+                self.logger.warning(
+                    "rqueue: scheduler %s could not reach PostgreSQL; retrying",
+                    self.scheduler_id,
+                    exc_info=True,
+                )
+            with contextlib.suppress(TimeoutError):
+                async with asyncio.timeout(self.interval):
+                    await self._stop.wait()
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    async def sync(self) -> list[Schedule]:
+        """Write the code-declared schedules into the database."""
+        stored: list[Schedule] = []
+        async with self.queue.pool.acquire() as connection:
+            for spec in self.schedules:
+                stored.append(
+                    await self._storage.upsert_schedule(
+                        connection,
+                        name=spec.name,
+                        queue=spec.queue or self.queue.name,
+                        task=spec.task,
+                        payload_json=validate_payload(spec.payload),
+                        cron=spec.cron,
+                        timezone=spec.timezone,
+                        enabled=spec.enabled,
+                        priority=spec.priority,
+                        max_attempts=spec.max_attempts,
+                        concurrency_key=spec.concurrency_key,
+                    )
+                )
+        return stored
+
+    # ------------------------------------------------------------------ tick
+
+    async def tick(self, *, now: datetime | None = None) -> list[Job]:
+        """Fire every occurrence that is due, and return the jobs created.
+
+        ``now`` is injectable so a test can advance the clock instead of
+        waiting a real cron period; production leaves it unset.
+        """
+        moment = now or datetime.now(UTC)
+        created: list[Job] = []
+        async with self.queue.pool.acquire() as connection:
+            await self._storage.record_runtime_heartbeat(
+                connection,
+                kind="scheduler",
+                instance=self.scheduler_id,
+                queue=self.queue.name,
+            )
+            schedules = await self._storage.list_schedules(
+                connection, enabled_only=True
+            )
+            for schedule in schedules:
+                created.extend(
+                    await self.fire_due(schedule, now=moment, connection=connection)
+                )
+        if created:
+            self.metrics.counter("rqueue.schedule.fired", len(created))
+        return created
+
+    async def fire_due(
+        self,
+        schedule: Schedule,
+        *,
+        now: datetime | None = None,
+        connection: asyncpg.Connection | None = None,
+    ) -> list[Job]:
+        """Fire the due occurrences of one schedule."""
+        if connection is None:
+            async with self.queue.pool.acquire() as borrowed:
+                return await self.fire_due(schedule, now=now, connection=borrowed)
+
+        moment = now or datetime.now(UTC)
+        last = await self._storage.last_occurrence(connection, schedule.id)
+        created: list[Job] = []
+        for occurrence_at in self.due_occurrences(schedule, now=moment, last=last):
+            job = await self.fire_occurrence(
+                connection, schedule=schedule, occurrence_at=occurrence_at
+            )
+            if job is None:
+                self.logger.debug(
+                    "rqueue: occurrence %s of schedule %s was already fired",
+                    occurrence_at,
+                    schedule.name,
+                )
+                continue
+            created.append(job)
+        return created
+
+    def due_occurrences(
+        self,
+        schedule: Schedule,
+        *,
+        now: datetime,
+        last: datetime | None,
+    ) -> list[datetime]:
+        """Occurrence instants that are due and not yet recorded, oldest first.
+
+        The lower bound is the last recorded occurrence, or -- for a schedule
+        that has never fired -- the moment the schedule row was created. Without
+        that anchor, deploying a new ``@daily`` schedule at noon would
+        immediately fire that morning's midnight run.
+        """
+        cron = CronExpression.parse(schedule.cron)
+        tz = resolve_timezone(schedule.timezone)
+        floor = last if last is not None else schedule.created_at
+        found: list[datetime] = []
+        cursor = now
+        while len(found) < self.catchup:
+            occurrence = cron.previous(cursor, tz=tz)
+            if occurrence is None or occurrence <= floor:
+                break
+            found.append(occurrence)
+            cursor = occurrence - timedelta(minutes=1)
+        found.reverse()
+        return found
+
+    async def fire_occurrence(
+        self,
+        connection: asyncpg.Connection,
+        *,
+        schedule: Schedule,
+        occurrence_at: datetime,
+    ) -> Job | None:
+        """Record one occurrence and its job atomically, or lose the race.
+
+        Runs on the caller's connection so a test -- or an application that
+        wants the occurrence inside a wider transaction -- controls the commit.
+        """
+        spec = self.queue.build_insert(
+            JobRequest(
+                task=schedule.task,
+                payload=schedule.payload,
+                priority=schedule.priority,
+                max_attempts=schedule.max_attempts,
+                concurrency_key=schedule.concurrency_key,
+                metadata={
+                    "rqueue.schedule": schedule.name,
+                    "rqueue.occurrence_at": occurrence_at.isoformat(),
+                },
+            ),
+            queue_name=schedule.queue,
+        )
+        return await self._storage.fire_occurrence(
+            connection,
+            schedule_id=schedule.id,
+            occurrence_at=occurrence_at,
+            spec=spec,
+            fired_by=self.scheduler_id,
+        )
+
+    # ------------------------------------------------------------ inspection
+
+    async def occurrence_count(self, schedule_id: uuid.UUID) -> int:
+        async with self.queue.pool.acquire() as connection:
+            return await self._storage.occurrence_count(connection, schedule_id)
+
+    async def stored_schedules(self, *, enabled_only: bool = False) -> list[Schedule]:
+        async with self.queue.pool.acquire() as connection:
+            return await self._storage.list_schedules(
+                connection, enabled_only=enabled_only
+            )

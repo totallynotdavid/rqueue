@@ -1,0 +1,84 @@
+[tools]
+python = "3.14.6"
+uv = "0.11.29"
+postgres = "18.6"
+
+[tasks]
+install = "uv sync --group dev"
+
+lint = [
+  "uv run ruff check --select E,F,W,I,B,UP,S,SIM,RUF .",
+  "uv run ruff format --check .",
+  "uv run mypy --strict src tests",
+]
+
+fix = ["uv run ruff check --fix --unsafe-fixes .", "uv run ruff format ."]
+
+# The fast suite is service-free. The integration task owns PostgreSQL.
+test = "uv run pytest -n auto -m 'not integration'"
+test-integration = "bash scripts/integration.sh"
+
+# The master pipeline test from REQUIREMENTS.md section 11, on its own, for the
+# development outer loop.
+test-pipeline = "bash scripts/integration.sh tests/integration/test_master_pipeline.py"
+
+db = "mise run db:start"
+db-migrate = "mise run db:migrate"
+
+doctor = [
+  "uv run python --version",
+  "uv --version",
+  "uv run ruff --version",
+  "uv run mypy --version",
+]
+
+[tasks."db:init"]
+description = "Initialize the project-local PostgreSQL cluster"
+run = """
+data_dir="$PWD/.data/postgres"
+
+if [ ! -f "$data_dir/PG_VERSION" ]; then
+  mkdir -p "$data_dir"
+  mise x postgres -- initdb -D "$data_dir" -U rqueue \
+    --auth-host=trust --auth-local=trust --no-instructions
+fi
+"""
+
+[tasks."db:start"]
+description = "Start the project-local PostgreSQL cluster"
+depends = ["db:init"]
+run = """
+data_dir="$PWD/.data/postgres"
+
+if ! mise x postgres -- pg_isready -h 127.0.0.1 -p 5432 -U rqueue -q; then
+  mise x postgres -- pg_ctl -D "$data_dir" \
+    -l "$data_dir/server.log" \
+    -o "-h 127.0.0.1 -p 5432 -c fsync=off -c synchronous_commit=off -c full_page_writes=off" \
+    -w start
+fi
+
+if ! mise x postgres -- psql -h 127.0.0.1 -p 5432 -U rqueue -d rqueue -qAtc "SELECT 1" >/dev/null 2>&1; then
+  mise x postgres -- createdb -h 127.0.0.1 -p 5432 -U rqueue rqueue
+fi
+"""
+
+[tasks."db:stop"]
+description = "Stop the project-local PostgreSQL cluster"
+run = """
+data_dir="$PWD/.data/postgres"
+mise x postgres -- pg_ctl -D "$data_dir" stop -m fast -w 2>/dev/null || true
+"""
+
+[tasks."db:reset"]
+description = "Delete the project-local PostgreSQL cluster"
+run = """
+mise run db:stop
+rm -rf "$PWD/.data/postgres"
+"""
+
+[tasks."db:migrate"]
+description = "Apply rqueue migrations to the local development database"
+depends = ["db:start"]
+run = [
+  "uv run rqueue migrate --database-url \"${RQUEUE_DATABASE_URL:-postgresql://rqueue@127.0.0.1:5432/rqueue}\"",
+]

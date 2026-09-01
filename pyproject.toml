@@ -1,0 +1,88 @@
+[project]
+name = "rqueue"
+version = "0.2.0"
+description = "A durable PostgreSQL task queue for asyncpg applications"
+requires-python = ">=3.13"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "David Duran", email = "dadch1404@gmail.com" }]
+dependencies = [
+    "asyncpg>=0.31.0",
+]
+
+[project.scripts]
+rqueue = "rqueue.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.11,<0.12"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "rqueue"
+module-root = "src"
+
+[dependency-groups]
+dev = [
+    "mypy>=2.3.1",
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+    "pytest-xdist>=3.8.0",
+    "ruff==0.16.5",
+]
+
+[tool.ruff]
+target-version = "py313"
+line-length = 88
+indent-width = 4
+# Markdown is excluded so the formatter never rewrites REQUIREMENTS.md, which
+# is the spec this package is built against, not source to be reformatted.
+extend-exclude = ["__pycache__", "dist", "build", ".data", "*.md"]
+
+[tool.ruff.lint]
+# E/F/W = pycodestyle/pyflakes/pycodestyle warnings
+# I = isort
+# B = flake8-bugbear
+# UP = pyupgrade
+# S = flake8-bandit (Python security SAST)
+# SIM = flake8-simplify
+# RUF = ruff-specific
+select = ["E", "F", "W", "I", "B", "UP", "S", "SIM", "RUF"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["rqueue"]
+
+[tool.ruff.lint.per-file-ignores]
+# Asserts, dummy credentials, and f-string table names are fine in tests.
+"tests/**/*.py" = ["S101", "S105", "S106", "S311", "S608"]
+# S608 is suppressed in these three modules only. PostgreSQL has no bind
+# parameter for an identifier, so the schema name is interpolated -- after
+# rqueue.limits.validate_identifier has restricted it to [a-z_][a-z0-9_]* and
+# 63 bytes. Every caller-supplied *value* is a $n parameter; role and database
+# identifiers go through PostgreSQL's own format('%I'/'%L'). Enforced by
+# tests/test_storage_sql.py::test_no_statement_uses_string_formatting_for_values.
+"src/rqueue/storage.py" = ["S608"]
+"src/rqueue/migrations/__init__.py" = ["S608"]
+"src/rqueue/roles.py" = ["S608"]
+"scripts/database.py" = ["S608"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+line-ending = "auto"
+
+[tool.mypy]
+python_version = "3.13"
+strict = true
+ignore_missing_imports = true
+warn_unused_ignores = true
+disallow_untyped_defs = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-ra"
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+markers = [
+    "integration: uses a disposable database on the mise-managed PostgreSQL cluster; see mise run test-integration",
+]

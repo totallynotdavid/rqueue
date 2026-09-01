@@ -1,0 +1,1028 @@
+"""The only module in rqueue that writes SQL (REQUIREMENTS.md §8).
+
+Every statement here is a module-level constant built once from a fixed tuple
+of column names and a schema identifier that has been through
+:func:`rqueue.limits.validate_identifier`. No caller value is ever
+interpolated: values reach PostgreSQL exclusively as bind parameters.
+
+JSON columns are always read as ``::text`` and written as ``$n::text::jsonb``.
+The connection belongs to the application, which may have installed its own
+``jsonb`` codec on it; casting on both sides makes rqueue's behaviour identical
+either way.
+"""
+
+from __future__ import annotations
+
+import uuid
+from collections.abc import Sequence
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Any, Final
+
+import asyncpg
+
+from rqueue.errors import JobNotFound, LeaseLost, ScheduleNotFound, ValidationError
+from rqueue.limits import validate_identifier
+from rqueue.models import (
+    ACTIVE_STATES,
+    TERMINAL_STATES,
+    Attempt,
+    Job,
+    JobState,
+    QueueStats,
+    Schedule,
+)
+
+__all__ = ["ClaimedJob", "JobInsert", "Storage"]
+
+_JOB_FIELDS: Final = (
+    "id",
+    "queue",
+    "task",
+    "payload",
+    "state",
+    "priority",
+    "attempt",
+    "max_attempts",
+    "scheduled_at",
+    "created_at",
+    "updated_at",
+    "started_at",
+    "finished_at",
+    "dedupe_key",
+    "concurrency_key",
+    "worker_id",
+    "lease_token",
+    "leased_until",
+    "heartbeat_at",
+    "cancel_requested",
+    "timeout_seconds",
+    "error_type",
+    "error_message",
+    "metadata",
+)
+_JSON_FIELDS: Final = frozenset({"payload", "metadata"})
+
+_SCHEDULE_FIELDS: Final = (
+    "id",
+    "name",
+    "queue",
+    "task",
+    "payload",
+    "cron",
+    "timezone",
+    "enabled",
+    "priority",
+    "max_attempts",
+    "concurrency_key",
+    "created_at",
+    "updated_at",
+)
+
+#: ``pg_notify`` channels are identifiers, capped at 63 bytes. The channel is
+#: ``rqueue_<schema>``, so the schema has a tighter cap than PostgreSQL's own.
+_MAX_SCHEMA_LENGTH_FOR_CHANNEL: Final = 63 - len("rqueue_")
+
+
+def _columns(fields: Sequence[str], prefix: str = "") -> str:
+    qualifier = f"{prefix}." if prefix else ""
+    return ", ".join(
+        f"{qualifier}{name}::text AS {name}"
+        if name in _JSON_FIELDS
+        else f"{qualifier}{name}"
+        for name in fields
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class JobInsert:
+    """A fully validated job row, ready to be written.
+
+    Validation happens in :mod:`rqueue.queue` before any statement is sent, so
+    that ``enqueue_many`` can check an entire batch before writing a row.
+    """
+
+    id: uuid.UUID
+    queue: str
+    task: str
+    payload_json: str
+    priority: int
+    max_attempts: int
+    scheduled_at: datetime | None
+    dedupe_key: str | None
+    concurrency_key: str | None
+    timeout_seconds: float | None
+    metadata_json: str
+    raise_on_conflict: bool
+
+
+@dataclass(frozen=True, slots=True)
+class ClaimedJob:
+    """A job plus the lease token that authorizes writes to this attempt."""
+
+    job: Job
+    lease_token: uuid.UUID
+    leased_until: datetime
+
+
+class Storage:
+    """Static, parameterized SQL for one schema."""
+
+    def __init__(self, schema: str = "task_queue") -> None:
+        schema = validate_identifier(schema, kind="schema")
+        if len(schema) > _MAX_SCHEMA_LENGTH_FOR_CHANNEL:
+            raise ValidationError(
+                f"schema must be at most {_MAX_SCHEMA_LENGTH_FOR_CHANNEL} characters "
+                "so the rqueue_<schema> NOTIFY channel fits in an identifier"
+            )
+        self.schema = schema
+        self.notify_channel = f"rqueue_{schema}"
+        self._sql = _Statements(schema)
+
+    # ---------------------------------------------------------------- enqueue
+
+    async def insert_job(
+        self, connection: asyncpg.Connection, spec: JobInsert
+    ) -> tuple[Job, bool]:
+        """Insert one job; return it and whether this call created it.
+
+        The dedupe collision path is an ``ON CONFLICT ... DO UPDATE`` that
+        writes nothing, rather than ``DO NOTHING``. ``DO NOTHING`` does not
+        wait on a concurrent inserter, so a racing producer would get neither
+        an insert nor a row to return -- exactly the "skip mode drops silently"
+        problem §1 calls out in pgqueuer. ``DO UPDATE`` blocks on the other
+        transaction and then returns the row that won.
+        """
+        row = await connection.fetchrow(
+            self._sql.insert_job,
+            spec.id,
+            spec.queue,
+            spec.task,
+            spec.payload_json,
+            spec.priority,
+            spec.max_attempts,
+            spec.scheduled_at,
+            spec.dedupe_key,
+            spec.concurrency_key,
+            spec.timeout_seconds,
+            spec.metadata_json,
+        )
+        assert row is not None  # noqa: S101 - INSERT ... RETURNING always yields a row
+        return Job.from_row(row), row["id"] == spec.id
+
+    # ------------------------------------------------------------------ claim
+
+    async def claim(
+        self,
+        connection: asyncpg.Connection,
+        *,
+        queue: str,
+        worker_id: str,
+        tasks: Sequence[str],
+        limit: int,
+        lease_seconds: float,
+    ) -> list[ClaimedJob]:
+        """Lease up to ``limit`` due jobs for ``worker_id``.
+
+        One short transaction, never held across user code (§3). Candidate rows
+        are taken with ``FOR UPDATE SKIP LOCKED``; a candidate that carries a
+        named concurrency key must additionally win that key's slot, which is
+        where two workers racing for one business resource are serialized.
+        """
+        if not tasks:
+            return []
+        async with connection.transaction():
+            candidates = await connection.fetch(
+                self._sql.claim_candidates, queue, list(tasks), limit
+            )
+            if not candidates:
+                return []
+
+            ids: list[uuid.UUID] = []
+            tokens: list[uuid.UUID] = []
+            for candidate in candidates:
+                token = uuid.uuid4()
+                key = candidate["concurrency_key"]
+                if key is not None:
+                    acquired = await connection.fetchval(
+                        self._sql.acquire_slot,
+                        key,
+                        candidate["id"],
+                        token,
+                        worker_id,
+                        lease_seconds,
+                    )
+                    if acquired is None:
+                        continue
+                ids.append(candidate["id"])
+                tokens.append(token)
+
+            if not ids:
+                return []
+
+            rows = await connection.fetch(
+                self._sql.lease_jobs, ids, tokens, worker_id, lease_seconds
+            )
+            await connection.execute(
+                self._sql.open_attempts, [row["id"] for row in rows]
+            )
+
+        return [
+            ClaimedJob(
+                job=Job.from_row(row),
+                lease_token=row["lease_token"],
+                leased_until=row["leased_until"],
+            )
+            for row in rows
+        ]
+
+    # ---------------------------------------------------- lease-fenced writes
+
+    async def heartbeat(
+        self,
+        connection: asyncpg.Connection,
+        *,
+        job_id: uuid.UUID,
+        lease_token: uuid.UUID,
+        lease_seconds: float,
+    ) -> bool:
+        """Extend a lease; return whether cancellation has been requested.
+
+        Raises :class:`LeaseLost` if this token is no longer the current one --
+        the fencing check, made by SQL predicate rather than by reading the row
+        and deciding in Python.
+        """
+        async with connection.transaction():
+            row = await connection.fetchrow(
+                self._sql.heartbeat, job_id, lease_token, lease_seconds
+            )
+            if row is None:
+                raise LeaseLost(
+                    f"job {job_id} is no longer leased under token {lease_token}"
+                )
+            await connection.execute(
+                self._sql.extend_slot, job_id, lease_token, lease_seconds
+            )
+        return bool(row["cancel_requested"])
+
+    async def complete(
+        self,
+        connection: asyncpg.Connection,
+        *,
+        job_id: uuid.UUID,
+        lease_token: uuid.UUID,
+    ) -> Job:
+        return await self._finalize(
+            connection,
+            self._sql.complete,
+            job_id=job_id,
+            lease_token=lease_token,
+            outcome="succeeded",
+        )
+
+    async def fail_terminal(
+        self,
+        connection: asyncpg.Connection,
+        *,
+        job_id: uuid.UUID,
+        lease_token: uuid.UUID,
+        error_type: str,
+        error_message: str,
+    ) -> Job:
+        return await self._finalize(
+            connection,
+            self._sql.fail_terminal,
+            job_id=job_id,
+            lease_token=lease_token,
+            outcome="failed",
+            error_type=error_type,
+            error_message=error_message,
+        )
+
+    async def cancel_leased(
+        self,
+        connection: asyncpg.Connection,
+        *,
+        job_id: uuid.UUID,
+        lease_token: uuid.UUID,
+        reason: str,
+    ) -> Job:
+        return await self._finalize(
+            connection,
+            self._sql.cancel_leased,
+            job_id=job_id,
+            lease_token=lease_token,
+            outcome="cancelled",
+            error_type="Cancelled",
+            error_message=reason,
+        )
+
+    async def reschedule(
+        self,
+        connection: asyncpg.Connection,
+        *,
+        job_id: uuid.UUID,
+        lease_token: uuid.UUID,
+        retry_at: datetime,
+        error_type: str,
+        error_message: str,
+    ) -> Job:
+        """Return a leased job to ``pending`` for a later attempt."""
+        return await self._finalize(
+            connection,
+            self._sql.reschedule,
+            job_id=job_id,
+            lease_token=lease_token,
+            outcome="retry",
+            error_type=error_type,
+            error_message=error_message,
+            extra=(retry_at,),
+        )
+
+    async def _finalize(
+        self,
+        connection: asyncpg.Connection,
+        statement: str,
+        *,
+        job_id: uuid.UUID,
+        lease_token: uuid.UUID,
+        outcome: str,
+        error_type: str | None = None,
+        error_message: str | None = None,
+        extra: tuple[Any, ...] = (),
+    ) -> Job:
+        """Apply one lease-fenced terminal or retry transition.
+
+        Job row, attempt record, and concurrency slot move together in one
+        transaction so an observer never sees a finished job still holding a
+        concurrency slot.
+        """
+        args: tuple[Any, ...] = (job_id, lease_token, *extra)
+        if error_type is not None or error_message is not None:
+            args = (*args, error_type, error_message)
+        async with connection.transaction():
+            row = await connection.fetchrow(statement, *args)
+            if row is None:
+                raise LeaseLost(
+                    f"job {job_id} is no longer leased under token {lease_token}; "
+                    "another attempt has taken over"
+                )
+            await connection.execute(
+                self._sql.close_attempt,
+                job_id,
+                lease_token,
+                outcome,
+                error_type,
+                error_message,
+            )
+            await connection.execute(self._sql.release_slot, job_id, lease_token)
+        return Job.from_row(row)
+
+    # -------------------------------------------------------------- recovery
+
+    async def recover_expired_leases(
+        self,
+        connection: asyncpg.Connection,
+        *,
+        queue: str,
+        limit: int = 100,
+    ) -> list[uuid.UUID]:
+        """Make jobs whose lease expired eligible again, or fail them.
+
+        Clearing ``lease_token`` is what makes the stale holder's next write
+        fail: its token no longer matches any row, so ``complete``/``fail``
+        raise :class:`LeaseLost` (§10.5). A job that has already used its last
+        attempt becomes a durable failure instead of looping forever, and a job
+        cancelled while leased is finalized here if its holder never came back.
+        """
+        rows = await connection.fetch(self._sql.recover_expired, queue, limit)
+        return [row["id"] for row in rows]
+
+    # ------------------------------------------------------------ inspection
+
+    async def get_job(
+        self, connection: asyncpg.Connection, job_id: uuid.UUID
+    ) -> Job | None:
+        row = await connection.fetchrow(self._sql.get_job, job_id)
+        return Job.from_row(row) if row is not None else None
+
+    async def list_jobs(
+        self,
+        connection: asyncpg.Connection,
+        *,
+        queue: str | None = None,
+        states: Sequence[JobState | str] | None = None,
+        task: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[Job]:
+        state_values = [str(state) for state in states] if states else None
+        rows = await connection.fetch(
+            self._sql.list_jobs, queue, state_values, task, limit, offset
+        )
+        return [Job.from_row(row) for row in rows]
+
+    async def attempts(
+        self, connection: asyncpg.Connection, job_id: uuid.UUID
+    ) -> list[Attempt]:
+        rows = await connection.fetch(self._sql.list_attempts, job_id)
+        return [Attempt.from_row(row) for row in rows]
+
+    async def stats(self, connection: asyncpg.Connection, *, queue: str) -> QueueStats:
+        row = await connection.fetchrow(self._sql.stats, queue)
+        assert row is not None  # noqa: S101 - aggregate query always returns a row
+        return QueueStats(
+            queue=queue,
+            pending=row["pending"],
+            leased=row["leased"],
+            succeeded=row["succeeded"],
+            failed=row["failed"],
+            cancelled=row["cancelled"],
+            ready=row["ready"],
+            oldest_ready_age_seconds=row["oldest_ready_age_seconds"],
+            expired_leases=row["expired_leases"],
+        )
+
+    async def distinct_pending_tasks(
+        self, connection: asyncpg.Connection, *, queue: str
+    ) -> list[str]:
+        rows = await connection.fetch(self._sql.distinct_active_tasks, queue)
+        return [row["task"] for row in rows]
+
+    # ---------------------------------------------------------- administration
+
+    async def cancel(self, connection: asyncpg.Connection, job_id: uuid.UUID) -> Job:
+        """Cancel a job.
+
+        A pending job is cancelled outright. A leased job only gets
+        ``cancel_requested``; §5 makes cancellation cooperative, so the lease
+        holder -- or lease expiry -- finalizes it.
+        """
+        row = await connection.fetchrow(self._sql.cancel, job_id)
+        if row is None:
+            raise JobNotFound(f"no job with id {job_id}")
+        return Job.from_row(row)
+
+    async def retry_terminal(
+        self,
+        connection: asyncpg.Connection,
+        job_id: uuid.UUID,
+        *,
+        scheduled_at: datetime | None = None,
+        additional_attempts: int = 1,
+    ) -> Job:
+        """Operator retry: the only path from a terminal state back to pending."""
+        row = await connection.fetchrow(
+            self._sql.retry_terminal, job_id, scheduled_at, additional_attempts
+        )
+        if row is None:
+            existing = await self.get_job(connection, job_id)
+            if existing is None:
+                raise JobNotFound(f"no job with id {job_id}")
+            raise LeaseLost(
+                f"job {job_id} is {existing.state}, not terminal; only a terminal "
+                "job can be retried by an operator"
+            )
+        return Job.from_row(row)
+
+    async def purge(
+        self,
+        connection: asyncpg.Connection,
+        *,
+        queue: str | None,
+        older_than: datetime,
+        states: Sequence[str] = TERMINAL_STATES,
+        limit: int = 10000,
+    ) -> int:
+        return int(
+            await connection.fetchval(
+                self._sql.purge, queue, older_than, list(states), limit
+            )
+            or 0
+        )
+
+    # -------------------------------------------------------------- schedules
+
+    async def upsert_schedule(
+        self,
+        connection: asyncpg.Connection,
+        *,
+        name: str,
+        queue: str,
+        task: str,
+        payload_json: str,
+        cron: str,
+        timezone: str,
+        enabled: bool,
+        priority: int,
+        max_attempts: int,
+        concurrency_key: str | None,
+    ) -> Schedule:
+        row = await connection.fetchrow(
+            self._sql.upsert_schedule,
+            name,
+            queue,
+            task,
+            payload_json,
+            cron,
+            timezone,
+            enabled,
+            priority,
+            max_attempts,
+            concurrency_key,
+        )
+        assert row is not None  # noqa: S101 - upsert always returns a row
+        return Schedule.from_row(row)
+
+    async def list_schedules(
+        self, connection: asyncpg.Connection, *, enabled_only: bool = True
+    ) -> list[Schedule]:
+        rows = await connection.fetch(self._sql.list_schedules, enabled_only)
+        return [Schedule.from_row(row) for row in rows]
+
+    async def get_schedule(self, connection: asyncpg.Connection, name: str) -> Schedule:
+        row = await connection.fetchrow(self._sql.get_schedule, name)
+        if row is None:
+            raise ScheduleNotFound(f"no schedule named {name!r}")
+        return Schedule.from_row(row)
+
+    async def delete_schedule(self, connection: asyncpg.Connection, name: str) -> bool:
+        return bool(await connection.fetchval(self._sql.delete_schedule, name))
+
+    async def last_occurrence(
+        self, connection: asyncpg.Connection, schedule_id: uuid.UUID
+    ) -> datetime | None:
+        value: datetime | None = await connection.fetchval(
+            self._sql.last_occurrence, schedule_id
+        )
+        return value
+
+    async def fire_occurrence(
+        self,
+        connection: asyncpg.Connection,
+        *,
+        schedule_id: uuid.UUID,
+        occurrence_at: datetime,
+        spec: JobInsert,
+        fired_by: str | None,
+    ) -> Job | None:
+        """Record one occurrence and the job it produces, atomically.
+
+        The job row and the occurrence row are written in a single transaction
+        (§6) -- a savepoint, when the caller already has one open. If the
+        occurrence key is already taken, the unique constraint rejects the
+        insert, this scheduler's job is rolled back with it, and the caller
+        learns it lost the race. If the process dies part way through, neither
+        row survives and the next tick retries the same occurrence -- which is
+        exactly why this design needs no leader election and no schedule-row
+        reclaim.
+
+        A plain INSERT rather than ``ON CONFLICT DO NOTHING``: the plain form
+        waits on a competing uncommitted occurrence and then proceeds if that
+        transaction aborted, where DO NOTHING would give up on an occurrence
+        nobody ended up firing.
+        """
+        try:
+            async with connection.transaction():
+                job, _ = await self.insert_job(connection, spec)
+                await connection.execute(
+                    self._sql.insert_occurrence,
+                    schedule_id,
+                    occurrence_at,
+                    spec.id,
+                    fired_by,
+                )
+                return job
+        except asyncpg.UniqueViolationError:
+            return None
+
+    async def occurrence_count(
+        self, connection: asyncpg.Connection, schedule_id: uuid.UUID
+    ) -> int:
+        return int(
+            await connection.fetchval(self._sql.occurrence_count, schedule_id) or 0
+        )
+
+    # ------------------------------------------------------------- heartbeats
+
+    async def record_runtime_heartbeat(
+        self,
+        connection: asyncpg.Connection,
+        *,
+        kind: str,
+        instance: str,
+        queue: str | None,
+        metadata_json: str = "{}",
+    ) -> None:
+        await connection.execute(
+            self._sql.record_runtime_heartbeat, kind, instance, queue, metadata_json
+        )
+
+    async def live_instances(
+        self,
+        connection: asyncpg.Connection,
+        *,
+        kind: str,
+        since: datetime,
+        queue: str | None = None,
+    ) -> list[str]:
+        rows = await connection.fetch(self._sql.live_instances, kind, since, queue)
+        return [row["instance"] for row in rows]
+
+
+class _Statements:
+    """Every statement rqueue issues, built once per schema."""
+
+    def __init__(self, schema: str) -> None:
+        jobs = f"{schema}.jobs"
+        attempts = f"{schema}.job_attempts"
+        slots = f"{schema}.concurrency_slots"
+        schedules = f"{schema}.schedules"
+        occurrences = f"{schema}.schedule_occurrences"
+        beats = f"{schema}.runtime_heartbeats"
+        returning = _columns(_JOB_FIELDS)
+        job_cols = _columns(_JOB_FIELDS, "j")
+        schedule_cols = _columns(_SCHEDULE_FIELDS)
+        active = ", ".join(f"'{state}'" for state in ACTIVE_STATES)
+        terminal = ", ".join(f"'{state}'" for state in TERMINAL_STATES)
+
+        self.insert_job = f"""
+            INSERT INTO {jobs} (
+                id, queue, task, payload, state, priority, attempt, max_attempts,
+                scheduled_at, dedupe_key, concurrency_key, timeout_seconds, metadata
+            )
+            VALUES (
+                $1, $2, $3, $4::text::jsonb, 'pending', $5, 0, $6,
+                COALESCE($7::timestamptz, now()), $8, $9, $10, $11::text::jsonb
+            )
+            ON CONFLICT (queue, dedupe_key)
+                WHERE dedupe_key IS NOT NULL AND state IN ({active})
+            DO UPDATE SET updated_at = {jobs}.updated_at
+            RETURNING {returning}
+        """
+
+        self.claim_candidates = f"""
+            SELECT id, concurrency_key
+            FROM {jobs}
+            WHERE queue = $1
+              AND state = 'pending'
+              AND scheduled_at <= now()
+              AND NOT cancel_requested
+              AND attempt < max_attempts
+              AND task = ANY($2::text[])
+            ORDER BY priority DESC, scheduled_at, seq
+            FOR UPDATE SKIP LOCKED
+            LIMIT $3
+        """
+
+        self.acquire_slot = f"""
+            INSERT INTO {slots} (key, job_id, lease_token, worker_id, leased_until)
+            VALUES ($1, $2, $3, $4, now() + make_interval(secs => $5))
+            ON CONFLICT (key) DO UPDATE
+            SET job_id = EXCLUDED.job_id,
+                lease_token = EXCLUDED.lease_token,
+                worker_id = EXCLUDED.worker_id,
+                acquired_at = now(),
+                leased_until = EXCLUDED.leased_until
+            WHERE concurrency_slots.leased_until <= now()
+            RETURNING key
+        """
+
+        self.lease_jobs = f"""
+            UPDATE {jobs} AS j
+            SET state = 'leased',
+                attempt = j.attempt + 1,
+                worker_id = $3,
+                lease_token = v.token,
+                leased_until = now() + make_interval(secs => $4),
+                heartbeat_at = now(),
+                started_at = COALESCE(j.started_at, now()),
+                updated_at = now()
+            FROM unnest($1::uuid[], $2::uuid[]) AS v(id, token)
+            WHERE j.id = v.id AND j.state = 'pending'
+            RETURNING {job_cols}
+        """
+
+        self.open_attempts = f"""
+            INSERT INTO {attempts} (
+                job_id, queue, task, attempt, worker_id, lease_token, started_at
+            )
+            SELECT j.id, j.queue, j.task, j.attempt, j.worker_id, j.lease_token, now()
+            FROM {jobs} AS j
+            WHERE j.id = ANY($1::uuid[])
+        """
+
+        self.heartbeat = f"""
+            UPDATE {jobs}
+            SET heartbeat_at = now(),
+                leased_until = now() + make_interval(secs => $3),
+                updated_at = now()
+            WHERE id = $1 AND lease_token = $2 AND state = 'leased'
+            RETURNING cancel_requested
+        """
+
+        self.extend_slot = f"""
+            UPDATE {slots}
+            SET leased_until = now() + make_interval(secs => $3)
+            WHERE job_id = $1 AND lease_token = $2
+        """
+
+        finalize_head = f"UPDATE {jobs} AS j SET"
+        finalize_tail = (
+            "WHERE j.id = $1 AND j.lease_token = $2 AND j.state = 'leased' "
+            f"RETURNING {job_cols}"
+        )
+
+        self.complete = f"""
+            {finalize_head}
+                state = 'succeeded',
+                lease_token = NULL,
+                leased_until = NULL,
+                finished_at = now(),
+                error_type = NULL,
+                error_message = NULL,
+                updated_at = now()
+            {finalize_tail}
+        """
+
+        self.fail_terminal = f"""
+            {finalize_head}
+                state = 'failed',
+                lease_token = NULL,
+                leased_until = NULL,
+                finished_at = now(),
+                error_type = $3,
+                error_message = $4,
+                updated_at = now()
+            {finalize_tail}
+        """
+
+        self.cancel_leased = f"""
+            {finalize_head}
+                state = 'cancelled',
+                lease_token = NULL,
+                leased_until = NULL,
+                finished_at = now(),
+                error_type = $3,
+                error_message = $4,
+                updated_at = now()
+            {finalize_tail}
+        """
+
+        self.reschedule = f"""
+            {finalize_head}
+                state = 'pending',
+                lease_token = NULL,
+                leased_until = NULL,
+                worker_id = NULL,
+                heartbeat_at = NULL,
+                scheduled_at = $3,
+                error_type = $4,
+                error_message = $5,
+                updated_at = now()
+            {finalize_tail}
+        """
+
+        self.close_attempt = f"""
+            UPDATE {attempts}
+            SET finished_at = now(),
+                outcome = $3,
+                error_type = $4,
+                error_message = $5
+            WHERE job_id = $1 AND lease_token = $2 AND finished_at IS NULL
+        """
+
+        self.release_slot = f"""
+            DELETE FROM {slots} WHERE job_id = $1 AND lease_token = $2
+        """
+
+        # One statement so recovery is atomic per job: the attempt record is
+        # closed, the concurrency slot released, and the job row re-opened or
+        # failed together. Data-modifying CTEs run exactly once each, against
+        # the same snapshot, so `expired` names the same rows throughout.
+        self.recover_expired = f"""
+            WITH expired AS (
+                SELECT id, attempt, max_attempts, cancel_requested, lease_token
+                FROM {jobs}
+                WHERE queue = $1 AND state = 'leased' AND leased_until <= now()
+                ORDER BY leased_until
+                FOR UPDATE SKIP LOCKED
+                LIMIT $2
+            ),
+            closed AS (
+                UPDATE {attempts} AS a
+                SET finished_at = now(),
+                    outcome = 'lease_expired',
+                    error_type = 'LeaseExpired',
+                    error_message = 'lease expired before the attempt finished'
+                FROM expired AS e
+                WHERE a.job_id = e.id
+                  AND a.lease_token = e.lease_token
+                  AND a.finished_at IS NULL
+                RETURNING a.job_id
+            ),
+            released AS (
+                DELETE FROM {slots} AS s
+                USING expired AS e
+                WHERE s.job_id = e.id AND s.lease_token = e.lease_token
+                RETURNING s.job_id
+            )
+            UPDATE {jobs} AS j
+            SET state = CASE
+                    WHEN e.cancel_requested THEN 'cancelled'
+                    WHEN e.attempt >= e.max_attempts THEN 'failed'
+                    ELSE 'pending'
+                END,
+                lease_token = NULL,
+                leased_until = NULL,
+                worker_id = NULL,
+                heartbeat_at = NULL,
+                finished_at = CASE
+                    WHEN e.cancel_requested OR e.attempt >= e.max_attempts THEN now()
+                    ELSE NULL
+                END,
+                error_type = CASE
+                    WHEN e.cancel_requested THEN 'Cancelled'
+                    WHEN e.attempt >= e.max_attempts THEN 'LeaseExpired'
+                    ELSE j.error_type
+                END,
+                error_message = CASE
+                    WHEN e.cancel_requested
+                        THEN 'cancelled while leased; lease expired unfinalized'
+                    WHEN e.attempt >= e.max_attempts
+                        THEN 'lease expired before the attempt finished'
+                    ELSE j.error_message
+                END,
+                updated_at = now()
+            FROM expired AS e
+            WHERE j.id = e.id
+            RETURNING j.id
+        """
+
+        self.get_job = f"SELECT {returning} FROM {jobs} WHERE id = $1"
+
+        self.list_jobs = f"""
+            SELECT {job_cols}
+            FROM {jobs} AS j
+            WHERE ($1::text IS NULL OR j.queue = $1)
+              AND ($2::text[] IS NULL OR j.state = ANY($2))
+              AND ($3::text IS NULL OR j.task = $3)
+            ORDER BY j.seq DESC
+            LIMIT $4 OFFSET $5
+        """
+
+        self.list_attempts = f"""
+            SELECT id, job_id, attempt, worker_id, lease_token, started_at,
+                   finished_at, outcome, error_type, error_message
+            FROM {attempts}
+            WHERE job_id = $1
+            ORDER BY attempt
+        """
+
+        self.stats = f"""
+            SELECT
+                count(*) FILTER (WHERE state = 'pending')::int   AS pending,
+                count(*) FILTER (WHERE state = 'leased')::int    AS leased,
+                count(*) FILTER (WHERE state = 'succeeded')::int AS succeeded,
+                count(*) FILTER (WHERE state = 'failed')::int    AS failed,
+                count(*) FILTER (WHERE state = 'cancelled')::int AS cancelled,
+                count(*) FILTER (
+                    WHERE state = 'pending' AND scheduled_at <= now()
+                )::int AS ready,
+                EXTRACT(EPOCH FROM (now() - min(scheduled_at) FILTER (
+                    WHERE state = 'pending' AND scheduled_at <= now()
+                )))::float8 AS oldest_ready_age_seconds,
+                count(*) FILTER (
+                    WHERE state = 'leased' AND leased_until <= now()
+                )::int AS expired_leases
+            FROM {jobs}
+            WHERE queue = $1
+        """
+
+        self.distinct_active_tasks = f"""
+            SELECT DISTINCT task FROM {jobs}
+            WHERE queue = $1 AND state IN ({active})
+        """
+
+        self.cancel = f"""
+            UPDATE {jobs} AS j
+            SET state = CASE WHEN j.state = 'pending' THEN 'cancelled' ELSE j.state END,
+                cancel_requested = true,
+                finished_at = CASE
+                    WHEN j.state = 'pending' THEN now() ELSE j.finished_at
+                END,
+                error_type = CASE
+                    WHEN j.state = 'pending' THEN 'Cancelled' ELSE j.error_type
+                END,
+                error_message = CASE
+                    WHEN j.state = 'pending' THEN 'cancelled before execution'
+                    ELSE j.error_message
+                END,
+                updated_at = now()
+            WHERE j.id = $1
+            RETURNING {job_cols}
+        """
+
+        # The attempt counter is deliberately *not* reset: attempt records are
+        # immutable and keyed by (job_id, attempt), so a reset would collide
+        # with the history it is supposed to preserve. An operator retry grants
+        # a fresh budget by raising the ceiling instead.
+        self.retry_terminal = f"""
+            UPDATE {jobs} AS j
+            SET state = 'pending',
+                max_attempts = LEAST(
+                    1000, GREATEST(j.max_attempts, j.attempt + $3::int)
+                ),
+                scheduled_at = COALESCE($2::timestamptz, now()),
+                started_at = NULL,
+                finished_at = NULL,
+                worker_id = NULL,
+                lease_token = NULL,
+                leased_until = NULL,
+                heartbeat_at = NULL,
+                cancel_requested = false,
+                error_type = NULL,
+                error_message = NULL,
+                updated_at = now()
+            WHERE j.id = $1 AND j.state IN ({terminal})
+            RETURNING {job_cols}
+        """
+
+        self.purge = f"""
+            WITH doomed AS (
+                SELECT id FROM {jobs}
+                WHERE ($1::text IS NULL OR queue = $1)
+                  AND state = ANY($3::text[])
+                  AND finished_at < $2
+                ORDER BY finished_at
+                LIMIT $4
+            ),
+            removed AS (
+                DELETE FROM {jobs} WHERE id IN (SELECT id FROM doomed) RETURNING id
+            )
+            SELECT count(*)::int FROM removed
+        """
+
+        self.upsert_schedule = f"""
+            INSERT INTO {schedules} (
+                name, queue, task, payload, cron, timezone, enabled, priority,
+                max_attempts, concurrency_key
+            )
+            VALUES ($1, $2, $3, $4::text::jsonb, $5, $6, $7, $8, $9, $10)
+            ON CONFLICT (name) DO UPDATE
+            SET queue = EXCLUDED.queue,
+                task = EXCLUDED.task,
+                payload = EXCLUDED.payload,
+                cron = EXCLUDED.cron,
+                timezone = EXCLUDED.timezone,
+                enabled = EXCLUDED.enabled,
+                priority = EXCLUDED.priority,
+                max_attempts = EXCLUDED.max_attempts,
+                concurrency_key = EXCLUDED.concurrency_key,
+                updated_at = now()
+            RETURNING {schedule_cols}
+        """
+
+        self.list_schedules = f"""
+            SELECT {schedule_cols} FROM {schedules}
+            WHERE NOT $1::boolean OR enabled
+            ORDER BY name
+        """
+
+        self.get_schedule = f"SELECT {schedule_cols} FROM {schedules} WHERE name = $1"
+
+        self.delete_schedule = f"""
+            WITH removed AS (
+                DELETE FROM {schedules} WHERE name = $1 RETURNING 1
+            )
+            SELECT count(*)::int > 0 FROM removed
+        """
+
+        self.last_occurrence = f"""
+            SELECT max(occurrence_at) FROM {occurrences} WHERE schedule_id = $1
+        """
+
+        self.insert_occurrence = f"""
+            INSERT INTO {occurrences} (schedule_id, occurrence_at, job_id, fired_by)
+            VALUES ($1, $2, $3, $4)
+        """
+
+        self.occurrence_count = f"""
+            SELECT count(*)::int FROM {occurrences} WHERE schedule_id = $1
+        """
+
+        self.record_runtime_heartbeat = f"""
+            INSERT INTO {beats} (kind, instance, queue, updated_at, metadata)
+            VALUES ($1, $2, $3, now(), $4::text::jsonb)
+            ON CONFLICT (kind, instance) DO UPDATE
+            SET queue = EXCLUDED.queue,
+                updated_at = now(),
+                metadata = EXCLUDED.metadata
+        """
+
+        self.live_instances = f"""
+            SELECT instance FROM {beats}
+            WHERE kind = $1 AND updated_at >= $2
+              AND ($3::text IS NULL OR queue = $3)
+            ORDER BY instance
+        """
