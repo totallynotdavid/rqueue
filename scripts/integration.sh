@@ -24,6 +24,7 @@ done
 # picv-2025 skips db:start when COMPUTE_DATABASE_URL is set.
 if [ -z "${RQUEUE_DATABASE_URL:-}" ]; then
     mise run db:start
+    export RQUEUE_LOCAL_DATABASE_OWNER=1
 fi
 
 admin_url="$(
