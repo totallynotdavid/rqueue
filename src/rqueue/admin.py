@@ -12,8 +12,8 @@ from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
-from rqueue.limits import validate_priority
-from rqueue.models import Attempt, Job, JobState, QueueStats, Schedule
+from rqueue.limits import validate_priority, validate_queue_target
+from rqueue.models import Attempt, Job, JobState, QueuePause, QueueStats, Schedule
 from rqueue.storage import Storage
 
 if TYPE_CHECKING:
@@ -131,6 +131,49 @@ class Admin:
                 states=state_values,
                 limit=limit,
             )
+
+    # ------------------------------------------------------------ queue pause
+
+    async def pause_queue(self, name: str) -> QueuePause:
+        """Stop a queue admitting new work, durably and fleet-wide.
+
+        ``name='*'`` pauses every queue. Unlike :meth:`rqueue.Worker.stop`,
+        which ends one worker instance, this is a row every worker's claim
+        query reads, so it applies to replicas that have never heard of this
+        call and survives a restart of all of them. It does not touch work
+        already leased: an in-flight attempt runs to its normal end.
+        """
+        target = validate_queue_target(name)
+        async with self.pool.acquire() as connection:
+            return await self.storage.pause_queue(connection, queue=target)
+
+    async def resume_queue(self, name: str) -> list[str]:
+        """Let a queue admit work again, and return the queues resumed.
+
+        Resuming takes effect on the next claim, not on the next poll: the
+        pause lives in the claim query, so there is no per-worker state to
+        catch up. The NOTIFY this write fires only saves an *idle* worker the
+        rest of its poll interval.
+
+        ``name='*'`` resumes everything, including queues paused by name --
+        a "resume all" that silently left some queues paused would be a trap.
+        Resuming one queue by name, in contrast, does not lift a wildcard
+        pause: the narrower call cannot punch a hole in the broader one.
+        """
+        target = validate_queue_target(name)
+        async with self.pool.acquire() as connection:
+            return await self.storage.resume_queue(connection, queue=target)
+
+    async def paused_queues(self) -> list[QueuePause]:
+        """Every queue currently paused, with the instant it was paused."""
+        async with self.pool.acquire() as connection:
+            return await self.storage.paused_queues(connection)
+
+    async def is_queue_paused(self, name: str) -> bool:
+        """Whether ``name`` is paused, by its own row or by the wildcard."""
+        target = validate_queue_target(name)
+        async with self.pool.acquire() as connection:
+            return await self.storage.is_queue_paused(connection, queue=target)
 
     # -------------------------------------------------------------- schedules
 

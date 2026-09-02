@@ -33,6 +33,7 @@ from rqueue.models import (
     Attempt,
     Job,
     JobState,
+    QueuePause,
     QueueStats,
     Schedule,
 )
@@ -633,6 +634,40 @@ class Storage:
         rows = await connection.fetch(self._sql.live_instances, kind, since, queue)
         return [row["instance"] for row in rows]
 
+    # ------------------------------------------------------------ queue pause
+
+    async def pause_queue(
+        self, connection: asyncpg.Connection, *, queue: str
+    ) -> QueuePause:
+        """Pause ``queue``, or every queue when given the ``'*'`` wildcard.
+
+        Idempotent: a second pause leaves the first one's timestamp alone.
+        """
+        row = await connection.fetchrow(self._sql.pause_queue, queue)
+        assert row is not None  # noqa: S101 - the upsert always returns its row
+        return QueuePause.from_row(row)
+
+    async def resume_queue(
+        self, connection: asyncpg.Connection, *, queue: str
+    ) -> list[str]:
+        """Resume ``queue``, or every paused queue for ``'*'``.
+
+        Returns the queues that were actually paused before this call, so a
+        caller can tell a real resume from a no-op.
+        """
+        rows = await connection.fetch(self._sql.resume_queue, queue)
+        return [row["queue"] for row in rows]
+
+    async def paused_queues(self, connection: asyncpg.Connection) -> list[QueuePause]:
+        rows = await connection.fetch(self._sql.queue_pauses)
+        return [QueuePause.from_row(row) for row in rows]
+
+    async def is_queue_paused(
+        self, connection: asyncpg.Connection, *, queue: str
+    ) -> bool:
+        """Whether ``queue`` is paused, by its own row or by the wildcard."""
+        return bool(await connection.fetchval(self._sql.is_queue_paused, queue))
+
 
 class _Statements:
     """Every statement rqueue issues, built once per schema."""
@@ -644,6 +679,7 @@ class _Statements:
         schedules = f"{schema}.schedules"
         occurrences = f"{schema}.schedule_occurrences"
         beats = f"{schema}.runtime_heartbeats"
+        pauses = f"{schema}.queue_pauses"
         returning = _columns(_JOB_FIELDS)
         job_cols = _columns(_JOB_FIELDS, "j")
         schedule_cols = _columns(_SCHEDULE_FIELDS)
@@ -665,6 +701,15 @@ class _Statements:
             RETURNING {returning}
         """
 
+        # The pause check is a queue-wide gate, not a per-row one: it names no
+        # column of the jobs table, so PostgreSQL hoists it into an InitPlan
+        # evaluated once per claim and hangs a one-time filter off the index
+        # scan. A paused queue therefore returns zero rows with the claim index
+        # never executed at all; an unpaused one pays one read of a table that
+        # holds a row per queue ever paused. Enforcing it here rather than in
+        # Worker is what makes the pause hold for a worker that has not yet
+        # heard about it (0003_queue_pause.sql), which is stronger than either
+        # Oban's or River's in-process check.
         self.claim_candidates = f"""
             SELECT id, concurrency_key
             FROM {jobs}
@@ -674,6 +719,10 @@ class _Statements:
               AND NOT cancel_requested
               AND attempt < max_attempts
               AND task = ANY($2::text[])
+              AND NOT EXISTS (
+                  SELECT 1 FROM {pauses} AS p
+                  WHERE p.queue IN ($1, '*') AND p.paused_at IS NOT NULL
+              )
             ORDER BY priority DESC, scheduled_at, seq
             FOR UPDATE SKIP LOCKED
             LIMIT $3
@@ -1029,4 +1078,45 @@ class _Statements:
             WHERE kind = $1 AND updated_at >= $2
               AND ($3::text IS NULL OR queue = $3)
             ORDER BY instance
+        """
+
+        # Pausing an already-paused queue keeps the original paused_at and
+        # updated_at, so "paused since" survives a repeated call -- River's
+        # CASE-guarded UPDATE, expressed as an upsert because rqueue has no
+        # queue registry to UPDATE against.
+        self.pause_queue = f"""
+            INSERT INTO {pauses} (queue, paused_at, updated_at)
+            VALUES ($1, now(), now())
+            ON CONFLICT (queue) DO UPDATE
+            SET paused_at = COALESCE(queue_pauses.paused_at, EXCLUDED.paused_at),
+                updated_at = CASE
+                    WHEN queue_pauses.paused_at IS NULL THEN EXCLUDED.updated_at
+                    ELSE queue_pauses.updated_at
+                END
+            RETURNING queue, paused_at, updated_at
+        """
+
+        # '*' resumes everything, including any individually paused queue --
+        # "resume all" that left a queue paused because someone had paused it
+        # by name would be a trap. Resuming by name clears only that queue's
+        # row, so it cannot punch a hole in a global pause.
+        self.resume_queue = f"""
+            UPDATE {pauses}
+            SET paused_at = NULL, updated_at = now()
+            WHERE paused_at IS NOT NULL
+              AND CASE WHEN $1 = '*' THEN true ELSE queue = $1 END
+            RETURNING queue
+        """
+
+        self.queue_pauses = f"""
+            SELECT queue, paused_at, updated_at FROM {pauses}
+            WHERE paused_at IS NOT NULL
+            ORDER BY queue
+        """
+
+        self.is_queue_paused = f"""
+            SELECT EXISTS (
+                SELECT 1 FROM {pauses}
+                WHERE queue IN ($1, '*') AND paused_at IS NOT NULL
+            )
         """

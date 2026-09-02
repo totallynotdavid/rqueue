@@ -24,8 +24,10 @@ __all__ = [
     "MAX_METADATA_BYTES",
     "MAX_PAYLOAD_BYTES",
     "MAX_TASK_NAME_LENGTH",
+    "QUEUE_WILDCARD",
     "validate_identifier",
     "validate_payload",
+    "validate_queue_target",
 ]
 
 #: Largest serialized JSON payload accepted by ``enqueue`` (256 KiB).
@@ -63,6 +65,10 @@ _MAX_IDENTIFIER_LENGTH: Final = 63
 
 _NAME_RE: Final = re.compile(r"^[A-Za-z0-9_.:\-]+$")
 
+#: Stands for "every queue" in the operations that accept one. It is outside
+#: ``_NAME_RE`` on purpose, so no real queue can ever be named it.
+QUEUE_WILDCARD: Final = "*"
+
 
 def validate_identifier(value: str, *, kind: str) -> str:
     """Validate a PostgreSQL identifier that will be interpolated into SQL.
@@ -95,6 +101,18 @@ def validate_name(value: str, *, kind: str, max_length: int) -> str:
             f"(got {value!r})"
         )
     return value
+
+
+def validate_queue_target(value: str) -> str:
+    """Validate a queue name, or the ``'*'`` wildcard meaning every queue.
+
+    Queue-wide administration (pause, resume) takes either. The wildcard is a
+    sentinel rather than a pattern: it matches every queue because the pause
+    predicate reads it that way, exactly as ``role_queue_grants`` does.
+    """
+    if value == QUEUE_WILDCARD:
+        return value
+    return validate_name(value, kind="queue name", max_length=MAX_QUEUE_NAME_LENGTH)
 
 
 def validate_key(value: str | None, *, kind: str, max_length: int) -> str | None:

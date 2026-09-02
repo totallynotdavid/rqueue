@@ -29,6 +29,7 @@ from rqueue.limits import (
     MAX_ERROR_MESSAGE_LENGTH,
     MAX_ERROR_TYPE_LENGTH,
     MAX_WORKER_ID_LENGTH,
+    QUEUE_WILDCARD,
     truncate,
     validate_batch_size,
     validate_concurrency,
@@ -202,7 +203,10 @@ class Worker:
     def _on_notify(
         self, connection: object, pid: int, channel: str, payload: str
     ) -> None:
-        if payload != self.queue.name:
+        # A job wake-up carries the queue it landed in; resuming the '*'
+        # wildcard carries the wildcard, since it concerns every queue. No real
+        # queue can be named '*' (rqueue.limits), so the two never collide.
+        if payload not in (self.queue.name, QUEUE_WILDCARD):
             return
         self.metrics.counter("rqueue.wakeup", source="notify", queue=self.queue.name)
         self._wake.set()

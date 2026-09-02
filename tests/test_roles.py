@@ -52,3 +52,8 @@ def test_only_the_matching_action_is_subsumed() -> None:
     assert _drop_subsumed_column_privileges(
         {"SELECT", "SELECT (payload)", "UPDATE (updated_at)"}
     ) == {"SELECT", "UPDATE (updated_at)"}
+
+
+def test_a_worker_may_read_the_pause_table_but_not_write_it() -> None:
+    """Claiming reads queue_pauses; pausing is an operator action, not a worker's."""
+    assert merged(Capability.CONSUME)["queue_pauses"] == {"SELECT"}

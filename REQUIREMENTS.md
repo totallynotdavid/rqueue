@@ -202,8 +202,9 @@ await worker.run()
   `asyncio.to_thread(...)` call is automatically capacity-limited without
   every task author constructing their own executor.
 - The package offers explicit inspection/administration operations: get job,
-  list by state, retry terminal job, cancel pending job, and purge completed
-  jobs older than a retention period. These are not part of handler context.
+  list by state, retry terminal job, cancel pending job, purge completed jobs
+  older than a retention period, and pause/resume a queue. These are not part
+  of handler context.
 
 **Revised:** the original draft already specified async-only handlers; an
 intermediate revision of this document proposed adding first-class sync
@@ -216,6 +217,43 @@ project that tried the "auto-detect and route to a thread" design and walked
 it back. Stay async-only; the one-line `asyncio.to_thread` wrapper is not
 meaningful ceremony for a fully-synchronous handler, and it keeps the
 worker's execution model to one path instead of two.
+
+**Revised (2026-09-02):** this document never considered **durable,
+queue-wide pause/resume**, and the omission was an oversight rather than a
+decision. Both mature references have it — Oban's `pause_queue`/`resume_queue`
+(with a `:*` wildcard for every queue) and River's `QueuePause`/`QueueResume`
+— and it is a different operation from anything specified above: it stops a
+queue admitting *new* work across every worker replica at once, without
+killing a process, where `Worker.stop()`/`Worker.drain()` only ever affect the
+one worker instance they are called on and `cancel_job` only ever affects one
+job. An operator draining a database, holding back a queue during an incident,
+or gating a deploy has no way to express that with the API as specified. The
+decision is to build it, as `Admin.pause_queue(name)` /
+`Admin.resume_queue(name)`, with `'*'` meaning every queue.
+
+The design, briefly: a durable `queue_pauses` table (`paused_at timestamptz`,
+NULL meaning running — the instant, not a boolean, so an admin view gets
+"paused since" for free) is the single source of truth; the claim query itself
+carries the predicate, so a paused queue yields zero claimable rows in SQL
+regardless of what any worker process currently believes; `NOTIFY` on resume is
+a latency optimization for an idle worker and nothing more. That follows §3's
+existing rule for job wake-ups ("polling is the source of truth") and this
+document's stance that state transitions are enforced in SQL, not only in
+Python — which is also why Oban's model was *not* copied: Oban keeps `paused`
+in each producer process and rebroadcasts it over PubSub, so a restarted queue
+comes back running. It goes one step past River too: River stores the row but
+still tests it client-side before fetching, so a worker that has not yet polled
+can still issue a claim against a paused queue. Because rqueue already makes
+every claim decision in one statement, the check costs one InitPlan evaluation
+per claim and holds for workers that have never heard of the call.
+
+Deliberately *not* adopted from Oban: starting a `Worker` already paused
+(`Oban.start_queue(paused: true)`). In Oban the flag is per-producer state, so
+a constructor argument is the only way to express it; here the pause is durable
+and queue-wide, so `await admin.pause_queue(name)` before starting a worker
+already says it — exactly once, for the whole fleet. A per-`Worker` argument
+would either write global state from one replica's constructor or gate
+admission in Python, and both are worse than the call that already exists.
 
 ## 5. Retry, failure, and cancellation semantics
 
@@ -282,7 +320,8 @@ alternative seen in prior art. Three approaches were compared directly:
 - Queue tables live in a configurable schema (default `task_queue`), never in
   an application's business schema by default.
 - Required tables cover jobs, attempts/lease history, periodic schedules and
-  their fired occurrences, and schema migration state. Separate immutable
+  their fired occurrences, queue pause state (see §4), and schema migration
+  state. Separate immutable
   attempt records are preferred for auditability and debugging.
 - Indexes must support due-job claiming, active dedupe keys, lease expiry,
   queue/state inspection, and retention cleanup. Explain every index with its

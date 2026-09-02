@@ -42,6 +42,7 @@ are an explicit command that takes an advisory lock and is forward-only:
 $ rqueue --database-url "$DATABASE_URL" migrate
 applied 0001_core
 applied 0002_scheduling
+applied 0003_queue_pause
 ```
 
 Queue tables live in their own schema, `task_queue` by default, never in your
@@ -258,6 +259,43 @@ outright. On a *leased* job it sets `cancel_requested`; the lease holder sees it
 on its next heartbeat and finalizes the job -- or, if that worker never comes
 back, lease expiry does.
 
+## Pausing a queue
+
+Pausing stops a queue admitting **new** work across every worker replica,
+without stopping a process and without touching anything already leased:
+
+```python
+admin = Admin(pool)
+
+await admin.pause_queue("compute")   # every worker on `compute`, right now
+await admin.resume_queue("compute")
+await admin.pause_queue("*")         # every queue
+```
+
+The switch is a durable row (`queue_pauses.paused_at`), and the claim query
+itself reads it -- so the pause holds for a worker replica that has never heard
+of the call, and it survives a restart of all of them. That is deliberately
+stronger than the references: Oban keeps the flag in each producer process, so
+a restarted queue comes back running, and River stores the row but still checks
+it in the client, so a worker that has not polled yet can still issue a claim.
+Here a paused queue returns zero claimable rows at the database.
+
+`NOTIFY` is a latency optimization only, exactly as it is for job wake-ups: it
+saves an *idle* worker the rest of its poll interval when you resume. Nothing
+depends on its arrival.
+
+What pause does **not** do: it does not touch an in-flight attempt. A job leased
+before the pause runs, heartbeats, and finalizes normally -- pause is about
+admission, `Worker.stop()`/`drain()` are about a worker's own lifecycle, and
+`Admin.cancel_job` is about one job.
+
+`resume_queue("*")` resumes everything, including queues paused by name --
+a "resume all" that quietly left some queues paused would be a trap. Resuming
+one queue by name does not lift a wildcard pause; the narrower call cannot
+punch a hole in the broader one. `Admin.paused_queues()` lists what is paused
+and since when, and `Admin.is_queue_paused(name)` answers for one queue,
+wildcard included.
+
 ## Blocking work
 
 There is no sync-handler code path. Wrap blocking work explicitly:
@@ -312,8 +350,8 @@ $ rqueue grant-role --role api --capability produce --queue compute
 ```
 
 `Admin` exposes the same operations in-process: `get_job`, `list_jobs`,
-`attempts`, `stats`, `cancel_job`, `retry_job`, `purge`, and the schedule
-accessors. An operator retry keeps the attempt counter running -- attempt
+`attempts`, `stats`, `cancel_job`, `retry_job`, `purge`, `pause_queue` /
+`resume_queue`, and the schedule accessors. An operator retry keeps the attempt counter running -- attempt
 records are immutable, so a reset would collide with the history it is meant to
 preserve -- and grants a fresh budget by raising `max_attempts`.
 
@@ -352,6 +390,7 @@ bind parameters rather than interpolated SQL.
 | `schedules` | periodic schedule definitions |
 | `schedule_occurrences` | the occurrence keys that have fired, and their jobs |
 | `runtime_heartbeats` | worker and scheduler liveness, for readiness checks |
+| `queue_pauses` | which queues are paused, and since when |
 | `role_queue_grants` | which queues a granted role may reach |
 | `schema_migrations` | applied migration versions and their checksums |
 

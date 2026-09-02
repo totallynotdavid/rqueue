@@ -71,6 +71,10 @@ _TABLE_GRANTS: dict[Capability, tuple[tuple[str, str], ...]] = {
         ("job_attempts", "SELECT, INSERT, UPDATE"),
         ("concurrency_slots", "SELECT, INSERT, UPDATE, DELETE"),
         ("runtime_heartbeats", "SELECT, INSERT, UPDATE"),
+        # The claim query reads the pause table on every claim. SELECT only:
+        # pausing a queue is an operator action, not something a worker role
+        # may take.
+        ("queue_pauses", "SELECT"),
         ("schema_migrations", "SELECT"),
     ),
     Capability.SCHEDULE: (
@@ -85,6 +89,7 @@ _TABLE_GRANTS: dict[Capability, tuple[tuple[str, str], ...]] = {
         ("job_attempts", "SELECT"),
         ("schedules", "SELECT"),
         ("schedule_occurrences", "SELECT"),
+        ("queue_pauses", "SELECT"),
         ("schema_migrations", "SELECT"),
     ),
 }
