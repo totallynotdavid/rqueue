@@ -378,3 +378,17 @@ working pattern for exactly this — mirror it rather than inventing a new one.
   learning about a regression in claiming from a scheduler test failure
   later. It supplements, not replaces, the focused acceptance-criteria tests
   in §10 — those stay granular so a failure points at one mechanism.
+
+**Revised (2026-09-02):** neither this section nor §9 said anything about
+*consumer*-side testing, and every comparable library ships something for it
+(`procrastinate.testing.InMemoryConnector`, `PgQueuer.in_memory()`,
+`Oban.Testing`) — so a consumer such as picv-2025 had no way to unit-test
+"does my code enqueue the right job" short of a real PostgreSQL round trip or
+a hand-rolled fake that proves nothing about the call's shape. Added
+`rqueue.testing.RecordingQueue`: it routes every call through the real,
+database-free `Queue.build_insert` and records the validated request instead
+of writing it. It is explicitly **non-durable and non-simulating** — it proves
+a call is well-formed and would be accepted, and models no transactionality,
+dedupe resolution, claiming, or execution; those stay the job of the §10
+integration suite. It lives outside `rqueue/__init__.py`'s exports, following
+Procrastinate's precedent, so the production import surface is unchanged.
