@@ -88,11 +88,15 @@ stands as written.
   (`_drop_subsumed_column_privileges`).
 - §9 Non-goals: **met**. No callable/pickle/broker/workflow compatibility path
   is present in the reviewed public surface.
-- §10 Acceptance criteria: **met, except the §10.7 evidence gap**. Criteria 1-6,
+- §10 Acceptance criteria: **met**. Criteria 1-6,
   8-9 and the migration/retention portions of 10 passed existing tests, with the
   additional race tests above strengthening 3, 5, and 8. Criterion 7 has tests
-  for missed notifications and worker/scheduler restart, but I found no
-  integration test that actually restarts PostgreSQL. Criterion 10 was not
+  for missed notifications and worker/scheduler restart. The §10.7 evidence gap
+  is now closed by
+  `tests/integration/test_resilience.py::test_a_real_database_restart_delays_work_but_loses_none`,
+  which stops and starts the real postmaster (not just backends) and proves the
+  same no-work-lost guarantee through the `ConnectionRefusedError` window.
+  Criterion 10 was not
   fully met at review time because the producer-only role path described above
   was unusable; the grant fix closes it, and permanent tests now cover it:
   `tests/integration/test_operations.py::test_a_produce_only_role_can_enqueue`
@@ -126,5 +130,4 @@ The stress results support, rather than undermine, the key decisions:
 ## Recommended follow-up
 
 The producer-only enqueue authorization is resolved (see §8 above), with
-permanent producer-only integration tests. A PostgreSQL restart test should
-still be added to close the evidence gap in acceptance criterion §10.7.
+permanent producer-only integration tests.
