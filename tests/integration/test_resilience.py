@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import subprocess
 import time
 import uuid
 from collections.abc import AsyncIterator
@@ -183,6 +185,68 @@ async def test_a_database_restart_delays_work_but_loses_none(
             timeout=30,
             message="the worker must reconnect and keep working",
         )
+    assert sorted(processed) == ["after", "before"]
+
+
+async def test_a_real_database_restart_delays_work_but_loses_none(
+    queue: Queue, pool: asyncpg.Pool
+) -> None:
+    """A postmaster outage only delays work queued on either side of it."""
+    if not os.environ.get("RQUEUE_LOCAL_DATABASE_OWNER"):
+        pytest.skip("the integration suite does not own this PostgreSQL cluster")
+
+    processed: list[str] = []
+
+    async def work(payload: dict[str, str], context: TaskContext) -> None:
+        processed.append(payload["tag"])
+
+    queue.register(name="work", handler=work)
+    async with pool.acquire() as connection, connection.transaction():
+        before = await queue.enqueue(
+            connection, task="work", payload={"tag": "before"}, delay=1.5
+        )
+
+    worker = Worker(queue, worker_id="postmaster-survivor", poll_interval=0.1)
+    repo_root = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+    try:
+        async with running(worker):
+            # The serial integration run shares this cluster with other tests.
+            await asyncio.to_thread(
+                subprocess.run,
+                ["mise", "run", "db:stop"],
+                cwd=repo_root,
+                check=True,
+                timeout=60,
+            )
+            await asyncio.to_thread(
+                subprocess.run,
+                ["mise", "run", "db:start"],
+                cwd=repo_root,
+                check=True,
+                timeout=120,
+            )
+
+            after = await _enqueue_with_retry(queue, pool, {"tag": "after"})
+            await eventually(
+                lambda: _in_state(queue, before.id, JobState.SUCCEEDED),
+                timeout=120,
+                message="the job queued before the database restart must still run",
+            )
+            await eventually(
+                lambda: _in_state(queue, after.id, JobState.SUCCEEDED),
+                timeout=120,
+                message="the job queued after reconnection must still run",
+            )
+    finally:
+        # The following test needs the project-local cluster even if this test fails.
+        await asyncio.to_thread(
+            subprocess.run,
+            ["mise", "run", "db:start"],
+            cwd=repo_root,
+            check=True,
+            timeout=120,
+        )
+
     assert sorted(processed) == ["after", "before"]
 
 
