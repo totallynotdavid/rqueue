@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import uuid
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
+from urllib.parse import urlsplit
 
 import asyncpg
 import pytest
@@ -11,6 +14,7 @@ import pytest
 from rqueue import Admin, MigrationError, Queue, check_readiness, migrations
 from rqueue.models import JobState
 from rqueue.roles import Capability, provision_role, revoke_role
+from scripts.database import database_target
 
 # ------------------------------------------------------------------ migrations
 
@@ -404,6 +408,21 @@ async def test_role_provisioning_is_repeatable_and_revocable(
         }
         assert privileges == {"SELECT", "INSERT"}
 
+        # The enqueue statement's DO UPDATE needs UPDATE, but only on the one
+        # column it writes -- a table-level UPDATE would not show up here.
+        updatable = {
+            row["column_name"]
+            for row in await admin_connection.fetch(
+                """
+                SELECT column_name FROM information_schema.column_privileges
+                WHERE grantee = $1 AND table_schema = 'task_queue'
+                  AND table_name = 'jobs' AND privilege_type = 'UPDATE'
+                """,
+                role,
+            )
+        }
+        assert updatable == {"updated_at"}
+
         grants = await admin_connection.fetch(
             "SELECT queue FROM task_queue.role_queue_grants WHERE role_name = $1",
             role,
@@ -419,3 +438,147 @@ async def test_role_provisioning_is_repeatable_and_revocable(
         )
     finally:
         await admin_connection.close()
+
+
+async def test_produce_and_consume_merge_into_one_whole_table_update(
+    admin_dsn: str,
+) -> None:
+    """PRODUCE's column grant is subsumed, not emitted alongside CONSUME's."""
+    role = f"rq_role_{uuid.uuid4().hex[:8]}"
+    admin_connection = await asyncpg.connect(admin_dsn)
+    try:
+        await provision_role(
+            admin_connection,
+            role=role,
+            capabilities=[Capability.PRODUCE, Capability.CONSUME],
+            queues=["alpha"],
+            password="test-password",
+        )
+        privileges = {
+            row["privilege_type"]
+            for row in await admin_connection.fetch(
+                """
+                SELECT privilege_type FROM information_schema.role_table_grants
+                WHERE grantee = $1 AND table_schema = 'task_queue'
+                  AND table_name = 'jobs'
+                """,
+                role,
+            )
+        }
+        assert privileges == {"SELECT", "INSERT", "UPDATE"}
+    finally:
+        try:
+            await revoke_role(admin_connection, role=role, drop=True)
+        finally:
+            await admin_connection.close()
+
+
+@asynccontextmanager
+async def produce_only_pool(admin_dsn: str, queue: str) -> AsyncIterator[asyncpg.Pool]:
+    """A pool logged in as a role holding nothing but ``Capability.PRODUCE``."""
+    role = f"rq_producer_{uuid.uuid4().hex[:8]}"
+    password = "produce-only-test-password"
+    database = urlsplit(admin_dsn).path.lstrip("/")
+    target = database_target(admin_dsn, database, user=role, password=password)
+
+    admin_connection = await asyncpg.connect(admin_dsn)
+    try:
+        await provision_role(
+            admin_connection,
+            role=role,
+            capabilities=[Capability.PRODUCE],
+            queues=[queue],
+            password=password,
+        )
+        pool = await asyncpg.create_pool(target.database_url, min_size=1, max_size=2)
+        assert pool is not None
+        try:
+            yield pool
+        finally:
+            await pool.close()
+    finally:
+        try:
+            await revoke_role(admin_connection, role=role, drop=True)
+        finally:
+            await admin_connection.close()
+
+
+async def test_a_produce_only_role_can_enqueue(admin_dsn: str, queue_name: str) -> None:
+    """§10.10: PRODUCE alone has to be enough to enqueue, both insert paths.
+
+    Every enqueue is an ``INSERT ... ON CONFLICT ... DO UPDATE SET updated_at``
+    (see :meth:`rqueue.storage.Storage.insert_job`), and PostgreSQL demands
+    UPDATE privilege on ``updated_at`` for that statement even when no conflict
+    fires. Existing role coverage provisions produce *and* consume, which hides
+    the case this test exists for.
+    """
+    async with produce_only_pool(admin_dsn, queue_name) as pool:
+        queue = Queue(pool, name=queue_name)
+        async with pool.acquire() as connection:
+            # The plain insert path: no conflict, but the statement still
+            # names updated_at in its DO UPDATE.
+            async with connection.transaction():
+                fresh = await queue.enqueue(connection, task="prepare", payload={})
+            assert fresh.state == JobState.PENDING
+
+            # The conflict path itself: a second enqueue on a live dedupe key
+            # is resolved by the no-op DO UPDATE, which is what the column
+            # grant is actually for.
+            async with connection.transaction():
+                first = await queue.enqueue(
+                    connection,
+                    task="prepare",
+                    dedupe_key="sim:produce-only",
+                    on_conflict="return_existing",
+                )
+            async with connection.transaction():
+                second = await queue.enqueue(
+                    connection,
+                    task="prepare",
+                    dedupe_key="sim:produce-only",
+                    on_conflict="return_existing",
+                )
+            assert second.id == first.id
+
+            rows = await connection.fetch(
+                "SELECT id FROM task_queue.jobs WHERE queue = $1", queue_name
+            )
+            assert len(rows) == 2
+
+
+async def test_a_produce_only_role_cannot_rewrite_a_job(
+    admin_dsn: str, queue_name: str
+) -> None:
+    """The column grant stayed a column grant.
+
+    A blanket table-level UPDATE would also make this pass silently, so this is
+    the half of the fix that proves it is still least privilege.
+    """
+    async with produce_only_pool(admin_dsn, queue_name) as pool:
+        queue = Queue(pool, name=queue_name)
+        async with pool.acquire() as connection:
+            async with connection.transaction():
+                job = await queue.enqueue(connection, task="prepare", payload={})
+
+            for column, value in (
+                ("state", "'succeeded'"),
+                ("payload", "'{\"owned\": true}'::jsonb"),
+                ("attempt", "99"),
+                ("max_attempts", "99"),
+                ("cancel_requested", "true"),
+                ("lease_token", "gen_random_uuid()"),
+            ):
+                with pytest.raises(asyncpg.InsufficientPrivilegeError):
+                    await connection.execute(
+                        f"UPDATE task_queue.jobs SET {column} = {value} WHERE id = $1",
+                        job.id,
+                    )
+
+            # ... while the one column the enqueue statement needs is writable.
+            await connection.execute(
+                "UPDATE task_queue.jobs SET updated_at = updated_at WHERE id = $1",
+                job.id,
+            )
+            assert await connection.fetchval(
+                "SELECT state FROM task_queue.jobs WHERE id = $1", job.id
+            ) == str(JobState.PENDING)

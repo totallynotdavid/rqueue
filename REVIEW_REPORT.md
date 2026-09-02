@@ -3,10 +3,18 @@
 ## Result
 
 The implementation is substantially complete and the concurrency mechanisms
-tested here behaved correctly. One genuine gap remains: a role provisioned with
-`Capability.PRODUCE` alone cannot enqueue at all. This is a §8 least-privilege
-role bug and means the producer-only portion of acceptance criterion §10.10 is
-not met. No implementation files were changed.
+tested here behaved correctly. This review found one genuine gap: a role
+provisioned with `Capability.PRODUCE` alone could not enqueue at all -- a §8
+least-privilege role bug that left the producer-only portion of acceptance
+criterion §10.10 unmet. No implementation files were changed by the review
+itself.
+
+**That gap is now fixed.** `Capability.PRODUCE` grants
+`SELECT, INSERT, UPDATE (updated_at)` on `jobs`: the column-scoped UPDATE the
+enqueue statement's `ON CONFLICT ... DO UPDATE SET updated_at` requires, and
+nothing wider -- a producer still cannot write `state`, `payload`, or
+`attempt`. §8 and §10.10 are met as of that change; the rest of this report
+stands as written.
 
 ## Verification performed
 
@@ -57,28 +65,42 @@ not met. No implementation files were changed.
   metrics calls are distributed through `src/rqueue/worker.py:255-361` and
   readiness distinguishes connectivity, schema, worker, and scheduler in
   `src/rqueue/health.py:24-123`.
-- §8 Security/resource limits: **partially met**. Payloads and SQL values are
-  bounded/parameterized (`src/rqueue/limits.py:116-159`,
+- §8 Security/resource limits: **met (after the fix below)**. Payloads and SQL
+  values are bounded/parameterized (`src/rqueue/limits.py:116-159`,
   `src/rqueue/storage.py:1-10`) and RLS queue scoping exists in
-  `src/rqueue/migrations/0002_scheduling.sql:87-124`. However, the producer
-  role grants only `SELECT, INSERT` on jobs in `src/rqueue/roles.py:50-56`,
+  `src/rqueue/migrations/0002_scheduling.sql:87-124`. As reviewed, the producer
+  role granted only `SELECT, INSERT` on jobs in `src/rqueue/roles.py:50-56`,
   while every enqueue uses `ON CONFLICT ... DO UPDATE` in
   `src/rqueue/storage.py:649-661`. PostgreSQL requires UPDATE privilege for
-  that statement, so a producer-only role receives `permission denied for
+  that statement, so a producer-only role received `permission denied for
   table jobs` even for an enqueue with no dedupe conflict. Existing role tests
   provision both produce and consume, masking this case. An isolated
   producer-only probe against the disposable database failed at
   `src/rqueue/storage.py:156` with the exact PostgreSQL output:
   `asyncpg.exceptions.InsufficientPrivilegeError: permission denied for table
   jobs`.
+  **Fixed** in `src/rqueue/roles.py`: `Capability.PRODUCE` now grants
+  `SELECT, INSERT, UPDATE (updated_at)` on `jobs` -- column-scoped, so the
+  conflict path works while `state`, `payload`, and `attempt` stay unwritable.
+  The insert SQL and its conflict strategy were not changed. Because a
+  produce+consume role also collects a whole-table `UPDATE` from `CONSUME`,
+  `provision_role` drops the subsumed column entry before emitting the `GRANT`
+  (`_drop_subsumed_column_privileges`).
 - §9 Non-goals: **met**. No callable/pickle/broker/workflow compatibility path
   is present in the reviewed public surface.
-- §10 Acceptance criteria: **partially met**. Criteria 1-6, 8-9 and the
-  migration/retention portions of 10 passed existing tests, with the additional
-  race tests above strengthening 3, 5, and 8. Criterion 7 has tests for missed
-  notifications and worker/scheduler restart, but I found no integration test
-  that actually restarts PostgreSQL. Criterion 10 is not fully met because the
-  producer-only role path described above is unusable.
+- §10 Acceptance criteria: **met, except the §10.7 evidence gap**. Criteria 1-6,
+  8-9 and the migration/retention portions of 10 passed existing tests, with the
+  additional race tests above strengthening 3, 5, and 8. Criterion 7 has tests
+  for missed notifications and worker/scheduler restart, but I found no
+  integration test that actually restarts PostgreSQL. Criterion 10 was not
+  fully met at review time because the producer-only role path described above
+  was unusable; the grant fix closes it, and permanent tests now cover it:
+  `tests/integration/test_operations.py::test_a_produce_only_role_can_enqueue`
+  (plain insert *and* the dedupe `DO UPDATE` conflict path under a
+  PRODUCE-only role),
+  `::test_a_produce_only_role_cannot_rewrite_a_job` (the least-privilege
+  negative case), `::test_produce_and_consume_merge_into_one_whole_table_update`,
+  and `tests/test_roles.py` for the grant-merging step.
 - §11 Development workflow: **met**. `scripts/integration.sh` creates a fresh
   database, migrates it, provisions a scoped role, runs marked tests, and drops
   the database; `mise.toml` separates fast tests and integration tests and
@@ -103,7 +125,6 @@ The stress results support, rather than undermine, the key decisions:
 
 ## Recommended follow-up
 
-The captain should resolve the producer-only enqueue authorization (for example
-by changing the SQL shape or granting the narrowly required update capability),
-then add a real producer-only integration test. A PostgreSQL restart test should
-also be added to close the evidence gap in acceptance criterion §10.7.
+The producer-only enqueue authorization is resolved (see §8 above), with
+permanent producer-only integration tests. A PostgreSQL restart test should
+still be added to close the evidence gap in acceptance criterion §10.7.

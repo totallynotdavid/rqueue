@@ -51,9 +51,18 @@ class Capability(enum.StrEnum):
 # (table, privileges) per capability. Deliberately explicit rather than
 # "GRANT ALL ON ALL TABLES": a producer that can DELETE FROM jobs is not a
 # least-privilege producer.
+#
+# The producer's ``UPDATE (updated_at)`` on ``jobs`` is column-scoped on
+# purpose. Every enqueue is an ``INSERT ... ON CONFLICT ... DO UPDATE SET
+# updated_at = jobs.updated_at`` (see :meth:`rqueue.storage.Storage.insert_job`
+# for why that no-op update, and not ``DO NOTHING``, is the right conflict
+# path), and PostgreSQL demands UPDATE privilege on every column named in a
+# ``DO UPDATE SET`` -- even one that writes a column back to its own value. A
+# whole-table UPDATE would also let a producer rewrite ``state``, ``payload``,
+# or ``attempt``, which is exactly what §8 says a producer may not do.
 _TABLE_GRANTS: dict[Capability, tuple[tuple[str, str], ...]] = {
     Capability.PRODUCE: (
-        ("jobs", "SELECT, INSERT"),
+        ("jobs", "SELECT, INSERT, UPDATE (updated_at)"),
         ("job_attempts", "SELECT"),
         ("schema_migrations", "SELECT"),
     ),
@@ -79,6 +88,23 @@ _TABLE_GRANTS: dict[Capability, tuple[tuple[str, str], ...]] = {
         ("schema_migrations", "SELECT"),
     ),
 }
+
+
+def _drop_subsumed_column_privileges(privileges: set[str]) -> set[str]:
+    """Drop column-scoped privileges a whole-table grant already covers.
+
+    Capabilities are merged per table, so a role holding both PRODUCE and
+    CONSUME collects ``UPDATE (updated_at)`` from one and a whole-table
+    ``UPDATE`` from the other. Emitting both in one ``GRANT`` is redundant --
+    the table-wide privilege subsumes the column list -- so the narrower entry
+    is resolved away here rather than left for PostgreSQL to absorb silently.
+    """
+    resolved = set(privileges)
+    for privilege in privileges:
+        action, separator, _ = privilege.partition("(")
+        if separator and action.strip() in privileges:
+            resolved.discard(privilege)
+    return resolved
 
 
 async def _ddl(
@@ -156,7 +182,8 @@ async def provision_role(
             granted.setdefault(table, set()).update(
                 part.strip() for part in privileges.split(",")
             )
-    for table, allowed in sorted(granted.items()):
+    for table, merged in sorted(granted.items()):
+        allowed = _drop_subsumed_column_privileges(merged)
         await _ddl(
             connection,
             "GRANT " + ", ".join(sorted(allowed)) + " ON %I.%I TO %I",
