@@ -15,6 +15,7 @@ __all__ = [
     "Job",
     "JobRequest",
     "JobState",
+    "QueuePause",
     "QueueStats",
     "Schedule",
 ]
@@ -201,6 +202,32 @@ class JobRequest:
     concurrency_key: str | None = None
     timeout: float | None = None
     metadata: Mapping[str, Any] | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class QueuePause:
+    """The durable pause state of one queue, or of the ``'*'`` wildcard.
+
+    ``paused_at`` is the timestamp the pause was taken, not a boolean: an
+    operator looking at a stalled queue wants "paused since 03:14", and the
+    column costs nothing extra to carry. ``None`` means the queue is running.
+    """
+
+    queue: str
+    paused_at: datetime | None
+    updated_at: datetime
+
+    @property
+    def is_paused(self) -> bool:
+        return self.paused_at is not None
+
+    @classmethod
+    def from_row(cls, row: Mapping[str, Any]) -> QueuePause:
+        return cls(
+            queue=row["queue"],
+            paused_at=row["paused_at"],
+            updated_at=row["updated_at"],
+        )
 
 
 @dataclass(frozen=True, slots=True)

@@ -11,12 +11,14 @@ from rqueue.limits import (
     MAX_ERROR_MESSAGE_LENGTH,
     MAX_METADATA_BYTES,
     MAX_PAYLOAD_BYTES,
+    QUEUE_WILDCARD,
     truncate,
     validate_identifier,
     validate_key,
     validate_metadata,
     validate_name,
     validate_payload,
+    validate_queue_target,
     validate_scheduled_at,
 )
 
@@ -60,6 +62,16 @@ def test_names_reject_control_characters() -> None:
     with pytest.raises(ValidationError):
         validate_name("bad name", kind="task name", max_length=64)
     assert validate_name("prepare.simulation-1", kind="task name", max_length=64)
+
+
+def test_the_queue_wildcard_is_not_a_name_a_queue_could_take() -> None:
+    """Pause targets accept '*'; nothing else may, so the two never collide."""
+    assert validate_queue_target(QUEUE_WILDCARD) == "*"
+    assert validate_queue_target("compute") == "compute"
+    with pytest.raises(ValidationError):
+        validate_name(QUEUE_WILDCARD, kind="queue name", max_length=64)
+    with pytest.raises(ValidationError):
+        validate_queue_target("com*pute")
 
 
 def test_keys_carry_application_data_but_stay_bounded() -> None:

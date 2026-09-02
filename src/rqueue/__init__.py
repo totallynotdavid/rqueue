@@ -34,7 +34,15 @@ from rqueue.errors import (
 )
 from rqueue.health import Readiness, check_readiness
 from rqueue.metrics import LoggingMetricsSink, MetricsSink, NullMetricsSink
-from rqueue.models import Attempt, Job, JobRequest, JobState, QueueStats, Schedule
+from rqueue.models import (
+    Attempt,
+    Job,
+    JobRequest,
+    JobState,
+    QueuePause,
+    QueueStats,
+    Schedule,
+)
 from rqueue.queue import Queue
 from rqueue.retry import RetryPolicy
 from rqueue.scheduler import Scheduler, ScheduleSpec
@@ -62,6 +70,7 @@ __all__ = [
     "PayloadDecoder",
     "PermanentFailure",
     "Queue",
+    "QueuePause",
     "QueueStats",
     "Readiness",
     "Retry",

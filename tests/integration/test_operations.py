@@ -79,7 +79,7 @@ async def test_migrating_an_empty_database_installs_everything(
 ) -> None:
     connection, schema = scratch_schema
     applied = await migrations.migrate(connection, schema=schema)
-    assert [m.name for m in applied] == ["core", "scheduling"]
+    assert [m.name for m in applied] == ["core", "scheduling", "queue_pause"]
 
     state = await migrations.status(connection, schema=schema)
     assert state.up_to_date
@@ -101,6 +101,7 @@ async def test_migrating_an_empty_database_installs_everything(
         "schedule_occurrences",
         "runtime_heartbeats",
         "role_queue_grants",
+        "queue_pauses",
     }
 
 

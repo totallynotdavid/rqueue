@@ -56,6 +56,9 @@ def test_no_statement_uses_string_formatting_for_values() -> None:
         "'cancelled before execution'",
         "'worker'",
         "'scheduler'",
+        # The queue wildcard is a fixed sentinel, like the state names above,
+        # and the same one migration 0002's RLS policies already spell out.
+        "'*'",
     }
     literal = re.compile(r"'[^']*'")
     for name, sql in statements().items():
@@ -67,6 +70,24 @@ def test_claim_uses_skip_locked_and_a_deterministic_order() -> None:
     sql = statements()["claim_candidates"]
     assert "FOR UPDATE SKIP LOCKED" in sql
     assert "ORDER BY priority DESC, scheduled_at, seq" in sql
+
+
+def test_claim_is_gated_on_the_pause_table_in_sql() -> None:
+    """A paused queue must yield nothing regardless of what a Worker believes."""
+    sql = statements()["claim_candidates"]
+    assert "task_queue.queue_pauses" in sql
+    assert "p.queue IN ($1, '*')" in sql
+    assert "p.paused_at IS NOT NULL" in sql
+
+
+def test_pausing_twice_keeps_the_first_paused_at() -> None:
+    sql = statements()["pause_queue"]
+    assert "COALESCE(queue_pauses.paused_at, EXCLUDED.paused_at)" in sql
+
+
+def test_resuming_the_wildcard_clears_every_pause() -> None:
+    sql = statements()["resume_queue"]
+    assert "CASE WHEN $1 = '*' THEN true ELSE queue = $1 END" in sql
 
 
 def test_every_lease_fenced_write_checks_the_token() -> None:
