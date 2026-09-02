@@ -90,6 +90,48 @@ async def test_a_notification_wakes_a_worker_before_its_poll_interval(
         assert time.monotonic() - started < 10
 
 
+async def test_stop_before_run_does_not_prevent_a_reusable_worker(
+    queue: Queue, pool: asyncpg.Pool
+) -> None:
+    """A stop request made before run is consumed when the worker starts."""
+    completed = asyncio.Event()
+
+    async def work(payload: object, context: TaskContext) -> None:
+        completed.set()
+
+    queue.register(name="work", handler=work)
+    async with pool.acquire() as connection, connection.transaction():
+        job = await queue.enqueue(connection, task="work")
+
+    worker = Worker(queue, worker_id="reusable", poll_interval=0.05)
+    worker.stop()
+    await worker.drain(timeout=15)
+
+    assert completed.is_set()
+    finished = await queue.get_job(job.id)
+    assert finished is not None
+    assert finished.state == JobState.SUCCEEDED
+
+
+async def test_hard_cancelling_an_idle_worker_terminates_cleanly(
+    queue: Queue,
+) -> None:
+    async def work(payload: object, context: TaskContext) -> None:
+        raise AssertionError("the idle worker must not claim work")
+
+    queue.register(name="work", handler=work)
+    worker = Worker(queue, worker_id="idle-cancelled", poll_interval=60.0)
+    task = asyncio.create_task(worker.run())
+    await worker.wait_started()
+    await asyncio.sleep(0.1)
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=5)
+    stats = await queue.stats()
+    assert stats.leased == 0
+
+
 async def test_a_worker_restart_finishes_the_work(
     queue: Queue, pool: asyncpg.Pool
 ) -> None:
@@ -134,6 +176,55 @@ async def test_a_worker_restart_finishes_the_work(
         await eventually(
             lambda: _in_state(queue, job.id, JobState.SUCCEEDED),
             message="the restarted worker should finish the job",
+        )
+    assert completions == [2]
+
+
+async def test_hard_cancellation_hands_claimed_work_to_a_successor(
+    queue: Queue, pool: asyncpg.Pool
+) -> None:
+    first_started = asyncio.Event()
+    completions: list[int] = []
+
+    async def work(payload: object, context: TaskContext) -> None:
+        if context.attempt == 1:
+            first_started.set()
+            await asyncio.sleep(30)
+        completions.append(context.attempt)
+
+    queue.register(name="work", handler=work)
+    async with pool.acquire() as connection, connection.transaction():
+        job = await queue.enqueue(connection, task="work", max_attempts=3)
+
+    stopping = Worker(
+        queue,
+        worker_id="hard-cancelled",
+        poll_interval=0.05,
+        concurrency=1,
+        lease_duration=30,
+        shutdown_timeout=10,
+    )
+    task = asyncio.create_task(stopping.run())
+    await stopping.wait_started()
+    await asyncio.wait_for(first_started.wait(), timeout=15)
+
+    started_shutdown = time.monotonic()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=5)
+    assert time.monotonic() - started_shutdown < 5
+
+    handed_back = await queue.get_job(job.id)
+    assert handed_back is not None
+    assert handed_back.state == JobState.PENDING
+    assert handed_back.error_type == "WorkerShutdown"
+
+    async with running(
+        Worker(queue, worker_id="hard-cancel-successor", poll_interval=0.05)
+    ):
+        await eventually(
+            lambda: _in_state(queue, job.id, JobState.SUCCEEDED),
+            message="the successor should finish work after hard cancellation",
         )
     assert completions == [2]
 
