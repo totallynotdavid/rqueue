@@ -499,6 +499,10 @@ class Worker:
             if not handed_back:
                 self._leases.pop(job.id, None)
         if handed_back:
+            # Catching CancelledError above ran cleanup, but a caught
+            # CancelledError that is not re-raised lets this task complete
+            # normally. Re-raise so it still reports as cancelled to whatever
+            # is holding it, matching the cancellation _shutdown_inflight asked for.
             raise asyncio.CancelledError
 
     async def _invoke(

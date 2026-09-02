@@ -1,9 +1,13 @@
-"""The only module in rqueue that writes SQL (REQUIREMENTS.md §8).
+"""The only module that reads or writes job and schedule rows (REQUIREMENTS.md §8).
 
 Every statement here is a module-level constant built once from a fixed tuple
 of column names and a schema identifier that has been through
 :func:`rqueue.limits.validate_identifier`. No caller value is ever
 interpolated: values reach PostgreSQL exclusively as bind parameters.
+Schema DDL and role grants are separate concerns handled by
+:mod:`rqueue.migrations` and :mod:`rqueue.roles`; this module is only the
+runtime read/write path that :class:`~rqueue.Queue`, :class:`~rqueue.Worker`,
+:class:`~rqueue.Admin`, and :class:`~rqueue.Scheduler` share.
 
 JSON columns are always read as ``::text`` and written as ``$n::text::jsonb``.
 The connection belongs to the application, which may have installed its own

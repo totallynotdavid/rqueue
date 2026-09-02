@@ -11,9 +11,13 @@ migration 0002, driven by rows in ``role_queue_grants`` -- so the queue names a
 role may touch arrive as bind parameters, never as interpolated SQL.
 
 Role and schema names *are* identifiers, and PostgreSQL has no bind parameter
-for an identifier. Rather than quoting them in Python, every statement in this
-module is assembled server-side with ``format('... %I ... %L', $1, $2)`` and
-then executed, so quoting is done by PostgreSQL itself.
+for an identifier. DDL statements (``CREATE ROLE``, ``GRANT``, ...) are
+assembled server-side with ``format('... %I ... %L', $1, $2)`` and then
+executed, so quoting is done by PostgreSQL itself. The plain DML against
+``role_queue_grants`` interpolates the schema directly instead; that is safe
+only because the schema has already passed
+:func:`~rqueue.limits.validate_identifier`, the same protection
+:mod:`rqueue.storage` relies on.
 """
 
 from __future__ import annotations
