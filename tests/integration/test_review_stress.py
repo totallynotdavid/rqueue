@@ -9,8 +9,9 @@ from datetime import timedelta
 import asyncpg
 import pytest
 
-from rqueue import LeaseLost, Queue, Scheduler, ScheduleSpec
+from rqueue import Job, LeaseLost, Queue, Scheduler, ScheduleSpec
 from rqueue.models import JobState
+from rqueue.storage import ClaimedJob
 
 
 async def test_many_direct_claimers_do_not_duplicate_or_starve(
@@ -106,7 +107,7 @@ async def test_concurrent_producers_return_one_dedupe_job(
 ) -> None:
     barrier = asyncio.Barrier(32)
 
-    async def produce(index: int):
+    async def produce(index: int) -> Job:
         await barrier.wait()
         async with pool.acquire() as connection, connection.transaction():
             return await queue.enqueue(
@@ -125,7 +126,7 @@ async def test_concurrent_producers_return_one_dedupe_job(
 async def test_burst_enqueue_and_claim_keeps_one_concurrency_key_active(
     queue: Queue, pool: asyncpg.Pool
 ) -> None:
-    async def produce(index: int):
+    async def produce(index: int) -> Job:
         async with pool.acquire() as connection, connection.transaction():
             return await queue.enqueue(
                 connection,
@@ -136,7 +137,7 @@ async def test_burst_enqueue_and_claim_keeps_one_concurrency_key_active(
 
     jobs = await asyncio.gather(*(produce(i) for i in range(40)))
 
-    async def claim(worker: str):
+    async def claim(worker: str) -> list[ClaimedJob]:
         async with pool.acquire() as connection:
             return await queue.storage.claim(
                 connection,
