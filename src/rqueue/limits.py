@@ -1,8 +1,10 @@
 """Resource bounds and the validators that enforce them (REQUIREMENTS.md §8).
 
-Every bound here is also expressed as a CHECK constraint in the migrations, so
-a direct SQL writer cannot get past it either. The Python side exists to turn a
-bound violation into a typed error before a statement is ever sent.
+A bound on a persisted column is mirrored as a CHECK constraint in the
+migrations, so a direct SQL writer cannot get past it either. Bounds on
+runtime behaviour, such as concurrency, batch size, and lease duration, exist
+only here, since they never reach a column. Either way, the Python side turns
+a violation into a typed error before a statement is ever sent.
 """
 
 from __future__ import annotations

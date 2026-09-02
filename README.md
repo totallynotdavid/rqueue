@@ -298,7 +298,9 @@ bind parameters rather than interpolated SQL.
 | `schema_migrations` | applied migration versions and their checksums |
 
 Every index is declared in the migration next to the query it serves. All
-internal SQL is static and parameterized, and lives in `rqueue/storage.py`.
+internal SQL is static and parameterized. The runtime read/write path lives in
+`rqueue/storage.py`; schema DDL and role grants are separate concerns in
+`rqueue/migrations` and `rqueue/roles.py`.
 
 ## Development
 
