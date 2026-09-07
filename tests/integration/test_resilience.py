@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import os
 import subprocess
+import threading
 import time
 import uuid
 from collections.abc import AsyncIterator
@@ -178,6 +179,102 @@ async def test_a_worker_restart_finishes_the_work(
             message="the restarted worker should finish the job",
         )
     assert completions == [2]
+
+
+async def test_wait_shutdown_waits_for_a_blocking_thread(
+    queue: Queue, pool: asyncpg.Pool
+) -> None:
+    started = asyncio.Event()
+    release = threading.Event()
+    finished = threading.Event()
+
+    def blocking_work() -> None:
+        release.wait()
+        finished.set()
+
+    async def work(payload: object, context: TaskContext) -> None:
+        started.set()
+        await asyncio.to_thread(blocking_work)
+
+    queue.register(name="work", handler=work)
+    async with pool.acquire() as connection, connection.transaction():
+        job = await queue.enqueue(connection, task="work")
+
+    worker = Worker(
+        queue,
+        worker_id="wait-shutdown",
+        poll_interval=0.05,
+        concurrency=1,
+        shutdown_timeout=0.05,
+        executor_shutdown="wait",
+    )
+    run_task = asyncio.create_task(worker.run())
+    await worker.wait_started()
+    await asyncio.wait_for(started.wait(), timeout=15)
+
+    release_timer = threading.Timer(0.25, release.set)
+    release_timer.start()
+    shutdown_started = time.monotonic()
+    try:
+        await worker.shutdown(timeout=0.01)
+    finally:
+        release.set()
+        await asyncio.wait_for(run_task, timeout=15)
+
+    assert time.monotonic() - shutdown_started >= 0.15
+    assert finished.is_set()
+    handed_back = await queue.get_job(job.id)
+    assert handed_back is not None
+    assert handed_back.state == JobState.PENDING
+    assert handed_back.error_type == "WorkerShutdown"
+
+
+async def test_detach_shutdown_returns_and_hands_back_before_thread_finishes(
+    queue: Queue, pool: asyncpg.Pool
+) -> None:
+    started = asyncio.Event()
+    release = threading.Event()
+    finished = threading.Event()
+
+    def blocking_work() -> None:
+        release.wait()
+        finished.set()
+
+    async def work(payload: object, context: TaskContext) -> None:
+        started.set()
+        await asyncio.to_thread(blocking_work)
+
+    queue.register(name="work", handler=work)
+    async with pool.acquire() as connection, connection.transaction():
+        job = await queue.enqueue(connection, task="work")
+
+    worker = Worker(
+        queue,
+        worker_id="detach-shutdown",
+        poll_interval=0.05,
+        concurrency=1,
+        shutdown_timeout=0.05,
+        executor_shutdown="detach",
+    )
+    run_task = asyncio.create_task(worker.run())
+    await worker.wait_started()
+    await asyncio.wait_for(started.wait(), timeout=15)
+
+    shutdown_started = time.monotonic()
+    try:
+        await worker.shutdown(timeout=0.05)
+        elapsed = time.monotonic() - shutdown_started
+        assert elapsed < 2
+        assert not finished.is_set()
+
+        handed_back = await queue.get_job(job.id)
+        assert handed_back is not None
+        assert handed_back.state == JobState.PENDING
+        assert handed_back.error_type == "WorkerShutdown"
+    finally:
+        release.set()
+        await asyncio.wait_for(asyncio.to_thread(finished.wait), timeout=15)
+        await asyncio.wait_for(run_task, timeout=15)
 
 
 async def test_hard_cancellation_hands_claimed_work_to_a_successor(
