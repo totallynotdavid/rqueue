@@ -78,6 +78,23 @@ async def prepare_simulation(payload: PreparePayload, context: TaskContext) -> N
     ...
 ```
 
+When a handler catches an exception to update application-owned state before
+re-raising it, `context.will_retry(exc)` reports whether the worker's registered
+retry policy will schedule another attempt. It accounts for the last attempt
+and `PermanentFailure`, and reports `True` for `Retry` or `False` for
+`CancelJob`, without calculating a backoff timestamp:
+
+```python
+try:
+    await update_business_state(payload)
+except Exception as exc:
+    if context.will_retry(exc):
+        await mark_retrying(payload)
+    else:
+        await mark_failed(payload)
+    raise
+```
+
 A payload that fails to decode becomes a durable *failed* job without
 consuming the retry budget: the same bytes will not decode on a later attempt.
 
