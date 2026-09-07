@@ -10,7 +10,7 @@ import uuid
 from collections.abc import AsyncIterator, Awaitable
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
-from typing import Any, Final
+from typing import Any, Final, Literal
 
 import asyncpg
 
@@ -61,6 +61,13 @@ class Worker:
     The worker never holds a database transaction open across user code (§3):
     claiming, heartbeating, and finalizing each borrow a pooled connection for
     the duration of one short statement and give it straight back.
+
+    ``executor_shutdown="wait"`` is the safe default: after in-flight leases
+    are handed back, shutdown waits for any blocking work submitted with
+    ``asyncio.to_thread`` to finish. ``executor_shutdown="detach"`` returns
+    without waiting for those threads, but does not stop them. The process must
+    be terminated by its supervisor after a detached shutdown; do not reuse
+    this Worker, its detached executor, or start new work in that process.
     """
 
     def __init__(
@@ -74,6 +81,7 @@ class Worker:
         heartbeat_interval: float | None = None,
         poll_interval: float = 1.0,
         shutdown_timeout: float = 30.0,
+        executor_shutdown: Literal["wait", "detach"] = "wait",
         strict_tasks: bool = True,
         install_default_executor: bool = True,
         executor_max_workers: int | None = None,
@@ -101,8 +109,11 @@ class Worker:
             )
         if poll_interval <= 0:
             raise ValidationError("poll_interval must be positive")
+        if executor_shutdown not in ("wait", "detach"):
+            raise ValidationError("executor_shutdown must be either 'wait' or 'detach'")
         self.poll_interval = float(poll_interval)
         self.shutdown_timeout = float(shutdown_timeout)
+        self.executor_shutdown = executor_shutdown
         self.strict_tasks = strict_tasks
         self.install_default_executor = install_default_executor
         self.executor_max_workers = executor_max_workers or self.concurrency
@@ -119,6 +130,10 @@ class Worker:
         #: which attempts still need handing back.
         self._leases: dict[uuid.UUID, ClaimedJob] = {}
         self._started = asyncio.Event()
+        self._run_task: asyncio.Task[None] | None = None
+        self._shutdown_timeout_override: float | None = None
+        self._wait_for_blocking_threads_override: bool | None = None
+        self._detached = False
 
     # ------------------------------------------------------------- lifecycle
 
@@ -128,15 +143,29 @@ class Worker:
         With ``until_idle`` the loop returns once a poll finds no claimable
         work and nothing is in flight -- what :meth:`drain` exposes.
         """
+        if self._detached:
+            raise ConfigurationError(
+                "worker cannot run after executor shutdown with "
+                "wait_for_blocking_threads=False; "
+                "terminate the process instead"
+            )
+        if self._run_task is not None:
+            raise ConfigurationError("worker is already running")
+        self._run_task = asyncio.current_task()
         self._stop.clear()
-        await self._check_registry()
-        async with self._runtime():
-            self._started.set()
-            try:
-                await self._loop(until_idle=until_idle)
-            finally:
-                self._started.clear()
-                await self._shutdown_inflight()
+        try:
+            await self._check_registry()
+            async with self._runtime():
+                self._started.set()
+                try:
+                    await self._loop(until_idle=until_idle)
+                finally:
+                    self._started.clear()
+                    await self._shutdown_inflight()
+        finally:
+            self._run_task = None
+            self._shutdown_timeout_override = None
+            self._wait_for_blocking_threads_override = None
 
     async def drain(self, *, timeout: float | None = None) -> None:
         """Run until the queue has no immediately claimable work left."""
@@ -151,6 +180,38 @@ class Worker:
         self._stop.set()
         self._wake.set()
 
+    async def shutdown(
+        self,
+        *,
+        timeout: float | None = None,
+        wait_for_blocking_threads: bool | None = None,
+    ) -> None:
+        """Stop this run and wait for its bounded shutdown to complete.
+
+        ``timeout`` overrides :attr:`shutdown_timeout` for the grace period
+        given to in-flight handlers. ``wait_for_blocking_threads`` overrides
+        the constructor's ``executor_shutdown`` mode for this shutdown. When
+        it is false, lease hand-back still happens, but this method returns
+        without waiting for a running ``asyncio.to_thread`` call. Such a
+        process must then be terminated by its supervisor and must not start
+        more work.
+
+        This method is intended to be called while :meth:`run` is running in a
+        background task. Calling it before a run starts is a no-op.
+        """
+        if timeout is not None and timeout < 0:
+            raise ValidationError("shutdown timeout must not be negative")
+        run_task = self._run_task
+        if run_task is None:
+            return
+        self._shutdown_timeout_override = timeout
+        self._wait_for_blocking_threads_override = wait_for_blocking_threads
+        self.stop()
+
+        if run_task is asyncio.current_task():
+            return
+        await asyncio.shield(run_task)
+
     async def wait_started(self) -> None:
         await self._started.wait()
 
@@ -163,10 +224,13 @@ class Worker:
                     bounded_default_executor(
                         self.executor_max_workers,
                         thread_name_prefix=f"rqueue-{self.worker_id}",
+                        wait_for_blocking_threads=self._wait_for_blocking_threads,
                     )
                 )
             async with self._listener():
                 yield
+        if not self._wait_for_blocking_threads():
+            self._detached = True
 
     @asynccontextmanager
     async def _listener(self) -> AsyncIterator[None]:
@@ -381,17 +445,23 @@ class Worker:
         # A hard `task.cancel()` on run() means "stop now", not "stop in
         # shutdown_timeout seconds", so the grace period collapses.
         current = asyncio.current_task()
+        configured_grace = (
+            self.shutdown_timeout
+            if self._shutdown_timeout_override is None
+            else self._shutdown_timeout_override
+        )
         grace = (
-            0.0
-            if current is not None and current.cancelling()
-            else self.shutdown_timeout
+            0.0 if current is not None and current.cancelling() else configured_grace
         )
         if self._running:
             _, pending = await asyncio.wait(list(self._running.values()), timeout=grace)
             for task in pending:
                 task.cancel()
             if pending:
-                await asyncio.wait(pending, timeout=self.shutdown_timeout)
+                cancel_wait = (
+                    0.0 if not self._wait_for_blocking_threads() else configured_grace
+                )
+                await asyncio.wait(pending, timeout=cancel_wait)
 
         for entry in list(self._leases.values()):
             self._leases.pop(entry.job.id, None)
@@ -699,6 +769,12 @@ class Worker:
                 "rqueue: worker %s could not finalize a job it no longer leases",
                 self.worker_id,
             )
+
+    def _wait_for_blocking_threads(self) -> bool:
+        override = self._wait_for_blocking_threads_override
+        if override is not None:
+            return override
+        return self.executor_shutdown == "wait"
 
 
 def _describe(exc: BaseException) -> str:
