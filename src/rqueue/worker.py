@@ -19,7 +19,6 @@ from rqueue.errors import (
     CancelJob,
     ConfigurationError,
     LeaseLost,
-    PermanentFailure,
     Retry,
     UnknownTask,
     ValidationError,
@@ -517,6 +516,7 @@ class Worker:
             task=job.task,
             attempt=job.attempt,
             max_attempts=job.max_attempts,
+            retry=registration.retry,
             metadata=job.metadata,
             heartbeat=lambda: self._beat(job, token, cancel_event),
             cancel_event=cancel_event,
@@ -557,7 +557,7 @@ class Worker:
                     handler_task.cancel()
                     handed_back = True
             except Exception as exc:
-                await self._on_exception(job, token, registration, exc)
+                await self._on_exception(job, token, registration, context, exc)
             else:
                 await self._safe_finalize(self._succeed(job, token))
         finally:
@@ -601,8 +601,10 @@ class Worker:
         job: Job,
         token: uuid.UUID,
         registration: TaskRegistration,
+        context: TaskContext,
         exc: BaseException,
     ) -> None:
+        will_retry = context.will_retry(exc)
         if isinstance(exc, Retry):
             await self._safe_finalize(
                 self._reschedule(
@@ -631,9 +633,7 @@ class Worker:
             type(exc).__name__,
             exc_info=exc,
         )
-        if isinstance(exc, PermanentFailure) or not registration.retry.should_retry(
-            exc, attempt=job.attempt
-        ):
+        if not will_retry:
             await self._safe_finalize(
                 self._fail_terminal(job, token, type(exc).__name__, _describe(exc))
             )

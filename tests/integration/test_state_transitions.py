@@ -74,6 +74,46 @@ async def test_a_failing_handler_retries_then_succeeds(
     assert "transient failure 1" in (history[0].error_message or "")
 
 
+async def test_handler_and_worker_share_the_retry_decision(
+    queue: Queue, pool: asyncpg.Pool
+) -> None:
+    observed: list[bool] = []
+    predicate_calls = 0
+
+    def retry_if(exc: BaseException) -> bool:
+        nonlocal predicate_calls
+        predicate_calls += 1
+        return True
+
+    async def doomed(payload: object, context: TaskContext) -> None:
+        exc = RuntimeError(f"failure {context.attempt}")
+        observed.append(context.will_retry(exc))
+        raise exc
+
+    queue.register(
+        name="shared_decision",
+        handler=doomed,
+        retry=RetryPolicy(max_attempts=5, retry_if=retry_if, jitter=0.0),
+    )
+    async with pool.acquire() as connection, connection.transaction():
+        job = await queue.enqueue(
+            connection,
+            task="shared_decision",
+            max_attempts=2,
+        )
+
+    async with running(make_worker(queue)):
+        await eventually(
+            lambda: _in_state(queue, job.id, JobState.FAILED),
+            message="the persisted attempt limit should win over the registration",
+        )
+
+    assert observed == [True, False]
+    assert predicate_calls == 1
+    final = await queue.get_job(job.id)
+    assert final is not None and final.attempt == 2
+
+
 async def test_exhausting_the_budget_is_a_durable_terminal_failure(
     queue: Queue, pool: asyncpg.Pool
 ) -> None:
@@ -130,7 +170,9 @@ async def test_a_handler_can_choose_its_own_retry_instant(
     queue: Queue, pool: asyncpg.Pool
 ) -> None:
     async def defers(payload: object, context: TaskContext) -> None:
-        raise Retry(delay=3600, reason="upstream is rate limiting us")
+        exc = Retry(delay=3600, reason="upstream is rate limiting us")
+        assert context.will_retry(exc)
+        raise exc
 
     queue.register(name="defers", handler=defers)
     async with pool.acquire() as connection, connection.transaction():
@@ -248,7 +290,9 @@ async def test_a_handler_can_cancel_its_own_job(
     queue: Queue, pool: asyncpg.Pool
 ) -> None:
     async def gives_up(payload: object, context: TaskContext) -> None:
-        raise CancelJob("the upstream record disappeared")
+        exc = CancelJob("the upstream record disappeared")
+        assert not context.will_retry(exc)
+        raise exc
 
     queue.register(name="gives_up", handler=gives_up)
     async with pool.acquire() as connection, connection.transaction():

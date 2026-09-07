@@ -53,6 +53,12 @@ def test_attempt_budget_is_the_authority() -> None:
     assert not policy.should_retry(RuntimeError(), attempt=4)
 
 
+def test_job_attempt_budget_can_override_the_registered_policy() -> None:
+    policy = RetryPolicy(max_attempts=5)
+    assert not policy.should_retry(RuntimeError(), attempt=1, max_attempts=1)
+    assert policy.should_retry(RuntimeError(), attempt=1, max_attempts=2)
+
+
 def test_permanent_failure_is_never_retried() -> None:
     policy = RetryPolicy(max_attempts=10)
     assert not policy.should_retry(PermanentFailure("nope"), attempt=1)

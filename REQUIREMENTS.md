@@ -202,8 +202,9 @@ await worker.run()
   protocol; applications may supply a Pydantic TypeAdapter or a plain decoder.
   Decode failures are non-retryable and become a durable failed job.
 - `TaskContext` exposes only job id, attempt number, queue, lease-aware
-  heartbeat, logger/structured fields, and cooperative cancellation state. It
-  must not expose raw SQL or permit mutation of queue internals.
+  heartbeat, logger/structured fields, cooperative cancellation state, and the
+  `will_retry()` decision hook. It must not expose raw SQL or permit mutation
+  of queue internals.
 - **Handlers are `async def` only — no sync-handler code path.** If a task's
   work is blocking (CPU-bound simulation, subprocess, blocking I/O), the
   handler wraps it explicitly: `await asyncio.to_thread(blocking_fn, ...)`.

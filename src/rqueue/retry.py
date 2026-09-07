@@ -63,14 +63,27 @@ class RetryPolicy:
         reference = now or datetime.now(UTC)
         return reference + timedelta(seconds=self.backoff_seconds(attempt))
 
-    def should_retry(self, exc: BaseException, *, attempt: int) -> bool:
+    def should_retry(
+        self,
+        exc: BaseException,
+        *,
+        attempt: int,
+        max_attempts: int | None = None,
+    ) -> bool:
         """Whether ``exc`` on ``attempt`` earns another attempt.
 
+        ``max_attempts`` overrides the policy default for a job whose persisted
+        attempt budget differs from the task registration.
         A :class:`~rqueue.errors.PermanentFailure` is never retried regardless
         of the exception classes configured -- it is the handler stating that
         this job cannot succeed.
         """
-        if attempt >= self.max_attempts:
+        attempt_limit = (
+            self.max_attempts
+            if max_attempts is None
+            else validate_max_attempts(max_attempts)
+        )
+        if attempt >= attempt_limit:
             return False
         if isinstance(exc, PermanentFailure):
             return False

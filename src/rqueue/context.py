@@ -1,10 +1,11 @@
 """What a handler is given (REQUIREMENTS.md §4).
 
 :class:`TaskContext` exposes job identity, the attempt number, a lease-aware
-heartbeat, a logger with structured fields, and cooperative cancellation state
--- and nothing else. There is no connection, no SQL, and no way to move the job
-between states from inside a handler; outcomes are expressed by returning or by
-raising one of the signals in :mod:`rqueue.errors`.
+heartbeat, a logger with structured fields, cooperative cancellation state, and
+the :meth:`TaskContext.will_retry` decision hook. There is no connection, no
+SQL, and no way to move the job between states from inside a handler; outcomes
+are expressed by returning or by raising one of the signals in
+:mod:`rqueue.errors`.
 """
 
 from __future__ import annotations
@@ -14,6 +15,9 @@ import logging
 import uuid
 from collections.abc import Awaitable, Callable, Mapping
 from typing import Any, Final
+
+from rqueue.errors import CancelJob, Retry
+from rqueue.retry import RetryPolicy
 
 __all__ = ["TaskContext"]
 
@@ -27,6 +31,8 @@ class TaskContext:
         "_cancel_event",
         "_heartbeat",
         "_log_fields",
+        "_retry_decisions",
+        "_retry_policy",
         "attempt",
         "job_id",
         "logger",
@@ -44,6 +50,7 @@ class TaskContext:
         task: str,
         attempt: int,
         max_attempts: int,
+        retry: RetryPolicy,
         metadata: Mapping[str, Any],
         heartbeat: Callable[[], Awaitable[bool]],
         cancel_event: asyncio.Event,
@@ -54,6 +61,8 @@ class TaskContext:
         self.task = task
         self.attempt = attempt
         self.max_attempts = max_attempts
+        self._retry_policy = retry
+        self._retry_decisions: dict[int, tuple[BaseException, bool]] = {}
         self.metadata = dict(metadata)
         self._heartbeat = heartbeat
         self._cancel_event = cancel_event
@@ -82,6 +91,29 @@ class TaskContext:
     @property
     def is_last_attempt(self) -> bool:
         return self.attempt >= self.max_attempts
+
+    def will_retry(self, exc: BaseException) -> bool:
+        """Return the worker's final retry outcome for ``exc``.
+
+        The worker asks this same context when finalizing the handler, so a
+        stateful retry predicate is evaluated only once for one exception.
+        """
+        cached = self._retry_decisions.get(id(exc))
+        if cached is not None and cached[0] is exc:
+            return cached[1]
+
+        if isinstance(exc, Retry):
+            decision = True
+        elif isinstance(exc, CancelJob):
+            decision = False
+        else:
+            decision = self._retry_policy.should_retry(
+                exc,
+                attempt=self.attempt,
+                max_attempts=self.max_attempts,
+            )
+        self._retry_decisions[id(exc)] = (exc, decision)
+        return decision
 
     async def heartbeat(self) -> bool:
         """Extend the lease, and report whether cancellation was requested.
