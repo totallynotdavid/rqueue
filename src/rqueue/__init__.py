@@ -46,7 +46,7 @@ from rqueue.models import (
 from rqueue.queue import Queue
 from rqueue.retry import RetryPolicy
 from rqueue.scheduler import Scheduler, ScheduleSpec
-from rqueue.tasks import PayloadDecoder, TaskHandler, TaskRegistration
+from rqueue.tasks import PayloadDecoder, TaskDeclaration, TaskHandler, TaskRegistration
 from rqueue.worker import Worker
 
 __version__ = "0.2.0"
@@ -81,6 +81,7 @@ __all__ = [
     "ScheduleSpec",
     "Scheduler",
     "TaskContext",
+    "TaskDeclaration",
     "TaskHandler",
     "TaskRegistration",
     "UnknownTask",

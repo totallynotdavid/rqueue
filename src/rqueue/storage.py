@@ -25,8 +25,14 @@ from typing import Any, Final
 
 import asyncpg
 
-from rqueue.errors import JobNotFound, LeaseLost, ScheduleNotFound, ValidationError
-from rqueue.limits import validate_identifier
+from rqueue.errors import (
+    ConfigurationError,
+    JobNotFound,
+    LeaseLost,
+    ScheduleNotFound,
+    ValidationError,
+)
+from rqueue.limits import MAX_ERROR_MESSAGE_LENGTH, truncate, validate_identifier
 from rqueue.models import (
     ACTIVE_STATES,
     TERMINAL_STATES,
@@ -37,6 +43,7 @@ from rqueue.models import (
     QueueStats,
     Schedule,
 )
+from rqueue.retry import RetryPolicyData
 
 __all__ = ["ClaimedJob", "JobInsert", "Storage"]
 
@@ -65,8 +72,9 @@ _JOB_FIELDS: Final = (
     "error_type",
     "error_message",
     "metadata",
+    "retry_policy",
 )
-_JSON_FIELDS: Final = frozenset({"payload", "metadata"})
+_JSON_FIELDS: Final = frozenset({"payload", "metadata", "retry_policy"})
 
 _SCHEDULE_FIELDS: Final = (
     "id",
@@ -99,6 +107,15 @@ def _columns(fields: Sequence[str], prefix: str = "") -> str:
     )
 
 
+def _invalid_policy_message(value: Any) -> str:
+    message = truncate(
+        f"invalid persisted retry policy: {value}",
+        MAX_ERROR_MESSAGE_LENGTH,
+    )
+    assert message is not None  # noqa: S101 - the input is always rendered
+    return message
+
+
 @dataclass(frozen=True, slots=True)
 class JobInsert:
     """A fully validated job row, ready to be written.
@@ -118,6 +135,7 @@ class JobInsert:
     concurrency_key: str | None
     timeout_seconds: float | None
     metadata_json: str
+    retry_policy_json: str | None
     raise_on_conflict: bool
 
 
@@ -170,6 +188,7 @@ class Storage:
             spec.dedupe_key,
             spec.concurrency_key,
             spec.timeout_seconds,
+            spec.retry_policy_json,
             spec.metadata_json,
         )
         assert row is not None  # noqa: S101 - INSERT ... RETURNING always yields a row
@@ -205,7 +224,15 @@ class Storage:
 
             ids: list[uuid.UUID] = []
             tokens: list[uuid.UUID] = []
+            malformed: dict[uuid.UUID, str] = {}
             for candidate in candidates:
+                raw_policy = candidate["retry_policy"]
+                policy_error: str | None = None
+                if raw_policy is not None:
+                    try:
+                        RetryPolicyData.from_json(raw_policy)
+                    except ConfigurationError:
+                        policy_error = _invalid_policy_message(raw_policy)
                 token = uuid.uuid4()
                 key = candidate["concurrency_key"]
                 if key is not None:
@@ -219,6 +246,13 @@ class Storage:
                     )
                     if acquired is None:
                         continue
+                if policy_error is not None:
+                    await connection.execute(
+                        self._sql.quarantine_pending_policy,
+                        candidate["id"],
+                        policy_error,
+                    )
+                    malformed[candidate["id"]] = policy_error
                 ids.append(candidate["id"])
                 tokens.append(token)
 
@@ -228,18 +262,44 @@ class Storage:
             rows = await connection.fetch(
                 self._sql.lease_jobs, ids, tokens, worker_id, lease_seconds
             )
+            claimed: list[ClaimedJob] = []
+            malformed_leased: list[tuple[uuid.UUID, uuid.UUID, str]] = []
+            for row in rows:
+                leased_policy_error = malformed.get(row["id"])
+                if leased_policy_error is not None:
+                    malformed_leased.append(
+                        (row["id"], row["lease_token"], leased_policy_error)
+                    )
+                else:
+                    claimed.append(
+                        ClaimedJob(
+                            job=Job.from_row(row),
+                            lease_token=row["lease_token"],
+                            leased_until=row["leased_until"],
+                        )
+                    )
             await connection.execute(
                 self._sql.open_attempts, [row["id"] for row in rows]
             )
+            for job_id, lease_token, policy_error in malformed_leased:
+                await connection.fetchrow(
+                    self._sql.fail_invalid_policy,
+                    job_id,
+                    lease_token,
+                    "ConfigurationError",
+                    policy_error,
+                )
+                await connection.execute(
+                    self._sql.close_attempt,
+                    job_id,
+                    lease_token,
+                    "failed",
+                    "ConfigurationError",
+                    policy_error,
+                )
+                await connection.execute(self._sql.release_slot, job_id, lease_token)
 
-        return [
-            ClaimedJob(
-                job=Job.from_row(row),
-                lease_token=row["lease_token"],
-                leased_until=row["leased_until"],
-            )
-            for row in rows
-        ]
+        return claimed
 
     # ---------------------------------------------------- lease-fenced writes
 
@@ -689,11 +749,13 @@ class _Statements:
         self.insert_job = f"""
             INSERT INTO {jobs} (
                 id, queue, task, payload, state, priority, attempt, max_attempts,
-                scheduled_at, dedupe_key, concurrency_key, timeout_seconds, metadata
+                scheduled_at, dedupe_key, concurrency_key, timeout_seconds,
+                retry_policy, metadata
             )
             VALUES (
                 $1, $2, $3, $4::text::jsonb, 'pending', $5, 0, $6,
-                COALESCE($7::timestamptz, now()), $8, $9, $10, $11::text::jsonb
+                COALESCE($7::timestamptz, now()), $8, $9, $10,
+                $11::text::jsonb, $12::text::jsonb
             )
             ON CONFLICT (queue, dedupe_key)
                 WHERE dedupe_key IS NOT NULL AND state IN ({active})
@@ -711,7 +773,7 @@ class _Statements:
         # heard about it (0003_queue_pause.sql), which is stronger than either
         # Oban's or River's in-process check.
         self.claim_candidates = f"""
-            SELECT id, concurrency_key
+            SELECT id, concurrency_key, retry_policy::text AS retry_policy
             FROM {jobs}
             WHERE queue = $1
               AND state = 'pending'
@@ -726,6 +788,15 @@ class _Statements:
             ORDER BY priority DESC, scheduled_at, seq
             FOR UPDATE SKIP LOCKED
             LIMIT $3
+        """
+
+        self.quarantine_pending_policy = f"""
+            UPDATE {jobs}
+            SET retry_policy = NULL,
+                error_type = 'ConfigurationError',
+                error_message = $2,
+                updated_at = now()
+            WHERE id = $1 AND state = 'pending'
         """
 
         self.acquire_slot = f"""
@@ -801,6 +872,19 @@ class _Statements:
         self.fail_terminal = f"""
             {finalize_head}
                 state = 'failed',
+                lease_token = NULL,
+                leased_until = NULL,
+                finished_at = now(),
+                error_type = $3,
+                error_message = $4,
+                updated_at = now()
+            {finalize_tail}
+        """
+
+        self.fail_invalid_policy = f"""
+            {finalize_head}
+                state = 'failed',
+                retry_policy = NULL,
                 lease_token = NULL,
                 leased_until = NULL,
                 finished_at = now(),
@@ -986,6 +1070,19 @@ class _Statements:
                 max_attempts = LEAST(
                     1000, GREATEST(j.max_attempts, j.attempt + $3::int)
                 ),
+                retry_policy = CASE
+                    WHEN j.retry_policy IS NULL THEN NULL
+                    ELSE jsonb_set(
+                        j.retry_policy,
+                        ARRAY['max_attempts'],
+                        to_jsonb(
+                            LEAST(
+                                1000, GREATEST(j.max_attempts, j.attempt + $3::int)
+                            )
+                        ),
+                        false
+                    )
+                END,
                 scheduled_at = COALESCE($2::timestamptz, now()),
                 started_at = NULL,
                 finished_at = NULL,

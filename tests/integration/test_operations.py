@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -14,6 +15,7 @@ import pytest
 from rqueue import Admin, MigrationError, Queue, check_readiness, migrations
 from rqueue.models import JobState
 from rqueue.roles import Capability, provision_role, revoke_role
+from rqueue.storage import Storage
 from scripts.database import database_target
 
 # ------------------------------------------------------------------ migrations
@@ -79,7 +81,12 @@ async def test_migrating_an_empty_database_installs_everything(
 ) -> None:
     connection, schema = scratch_schema
     applied = await migrations.migrate(connection, schema=schema)
-    assert [m.name for m in applied] == ["core", "scheduling", "queue_pause"]
+    assert [m.name for m in applied] == [
+        "core",
+        "scheduling",
+        "queue_pause",
+        "retry_policy",
+    ]
 
     state = await migrations.status(connection, schema=schema)
     assert state.up_to_date
@@ -172,6 +179,110 @@ async def test_a_failing_migration_leaves_no_partial_schema(
         )
         is True
     )
+
+
+async def test_jobs_reject_malformed_retry_policy_data(
+    queue: Queue, pool: asyncpg.Pool
+) -> None:
+    """The database refuses invalid or executable policy payloads at insert."""
+    valid = {
+        "version": 1,
+        "max_attempts": 3,
+        "initial_backoff": 1.0,
+        "max_backoff": 3600.0,
+        "multiplier": 2.0,
+        "jitter": 0.1,
+    }
+    malformed = [
+        {**valid, "retry_if": "builtins:eval"},
+        {**valid, "retry_on": ["builtins:BaseException"]},
+        {**valid, "max_attempts": 3.0},
+        {**valid, "multiplier": 10**400},
+        {**valid, "max_attempts": 0},
+        {**valid, "max_attempts": 4},
+        {**valid, "jitter": 2.0},
+    ]
+
+    async with pool.acquire() as connection:
+        for index, policy in enumerate(malformed):
+            with pytest.raises(asyncpg.PostgresError):
+                await connection.execute(
+                    f"""
+                    INSERT INTO {queue.schema}.jobs
+                        (queue, task, payload, state, max_attempts, retry_policy)
+                    VALUES ($1, $2, '{{}}'::jsonb, 'pending', 3, $3::jsonb)
+                    """,
+                    queue.name,
+                    f"malformed-{index}",
+                    json.dumps(policy),
+                )
+
+        assert (
+            await connection.fetchval(
+                f"SELECT count(*) FROM {queue.schema}.jobs WHERE queue = $1",
+                queue.name,
+            )
+            == 0
+        )
+
+
+async def test_claim_handles_a_malformed_policy_without_leaking_a_lease(
+    scratch_schema: tuple[asyncpg.Connection, str],
+) -> None:
+    """A legacy/corrupt row fails durably inside the claim transaction."""
+    connection, schema = scratch_schema
+    await migrations.migrate(connection, schema=schema)
+    await connection.execute(
+        f"ALTER TABLE {schema}.jobs DROP CONSTRAINT jobs_retry_policy_shape"
+    )
+    await connection.execute(
+        f"""
+        INSERT INTO {schema}.jobs
+            (queue, task, payload, state, max_attempts, retry_policy)
+        VALUES ('q', 'bad-policy', '{{}}'::jsonb, 'pending', 3, '{{}}'::jsonb)
+        """
+    )
+    # Keep a live NOT VALID constraint in place. This models a legacy row
+    # that predates the policy shape check: PostgreSQL permits it to remain,
+    # but any UPDATE must satisfy the constraint. Claim must first quarantine
+    # the policy to NULL, otherwise lease_jobs itself would fail the UPDATE.
+    await connection.execute(
+        f"""
+        ALTER TABLE {schema}.jobs
+        ADD CONSTRAINT jobs_retry_policy_shape CHECK (
+            retry_policy IS NULL OR retry_policy ? 'version'
+        ) NOT VALID
+        """
+    )
+
+    claimed = await Storage(schema).claim(
+        connection,
+        queue="q",
+        worker_id="worker",
+        tasks=["bad-policy"],
+        limit=1,
+        lease_seconds=30.0,
+    )
+
+    assert claimed == []
+    row = await connection.fetchrow(
+        f"SELECT id, state, attempt, lease_token, error_type, error_message "
+        f"FROM {schema}.jobs"
+    )
+    assert row is not None
+    assert row["state"] == "failed"
+    assert row["attempt"] == 1
+    assert row["lease_token"] is None
+    assert row["error_type"] == "ConfigurationError"
+    assert "invalid persisted retry policy" in row["error_message"]
+    assert "{}" in row["error_message"]
+    stored = await Storage(schema).get_job(connection, row["id"])
+    assert stored is not None and stored.retry_policy is None
+    attempt = await connection.fetchrow(
+        f"SELECT outcome FROM {schema}.job_attempts WHERE job_id = "
+        f"(SELECT id FROM {schema}.jobs)"
+    )
+    assert attempt is not None and attempt["outcome"] == "failed"
 
 
 async def test_a_tampered_migration_is_refused(

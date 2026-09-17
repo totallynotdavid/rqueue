@@ -116,6 +116,39 @@ async def test_registered_defaults_are_applied(queue: RecordingQueue) -> None:
     assert job.timeout_seconds == 42.0
 
 
+async def test_declared_defaults_are_applied_without_a_handler() -> None:
+    queue = RecordingQueue(name="compute")
+    queue.declare_task(
+        name="prepare_simulation",
+        retry=RetryPolicy(max_attempts=7),
+        timeout=42.0,
+    )
+
+    job = await queue.enqueue(task="prepare_simulation")
+
+    assert job.max_attempts == 7
+    assert job.timeout_seconds == 42.0
+    assert queue.tasks == {}
+
+
+async def test_declaration_and_registration_share_one_metadata_source() -> None:
+    queue = RecordingQueue(name="compute")
+    declaration = queue.declare_task(
+        name="prepare_simulation",
+        retry=RetryPolicy(max_attempts=7),
+        timeout=42.0,
+    )
+    registration = queue.register(name="prepare_simulation", handler=prepare_simulation)
+
+    assert registration.declaration is not declaration
+    assert registration.retry.max_attempts == declaration.retry.max_attempts
+    assert registration.retry.retry_on == queue.default_retry.retry_on
+    assert registration.retry.retry_if is queue.default_retry.retry_if
+    job = await queue.enqueue(task="prepare_simulation")
+    assert job.max_attempts == 7
+    assert job.timeout_seconds == 42.0
+
+
 async def test_an_unregistered_task_name_is_rejected(queue: RecordingQueue) -> None:
     with pytest.raises(UnknownTask, match="prepare_simulaton"):
         await queue.enqueue(task="prepare_simulaton")

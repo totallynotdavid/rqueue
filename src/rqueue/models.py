@@ -6,9 +6,13 @@ import enum
 import json
 import uuid
 from collections.abc import Mapping
+from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
+
+from rqueue.errors import ConfigurationError
+from rqueue.retry import RetryPolicyData
 
 __all__ = [
     "Attempt",
@@ -83,9 +87,14 @@ class Job:
     error_type: str | None = None
     error_message: str | None = None
     metadata: Mapping[str, Any] = field(default_factory=dict)
+    retry_policy: RetryPolicyData | None = None
 
     @classmethod
     def from_row(cls, row: Mapping[str, Any]) -> Job:
+        retry_policy = None
+        if row.get("retry_policy") is not None:
+            with suppress(ConfigurationError):
+                retry_policy = RetryPolicyData.from_json(row["retry_policy"])
         return cls(
             id=row["id"],
             queue=row["queue"],
@@ -111,6 +120,7 @@ class Job:
             error_type=row["error_type"],
             error_message=row["error_message"],
             metadata=json.loads(row["metadata"]),
+            retry_policy=retry_policy,
         )
 
 

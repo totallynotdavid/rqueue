@@ -492,6 +492,11 @@ class Worker:
             )
             self._leases.pop(job.id, None)
             return
+        registration = registration.for_job(
+            retry_policy=job.retry_policy,
+            max_attempts=job.max_attempts,
+            timeout=job.timeout_seconds,
+        )
 
         try:
             payload = registration.decoder(job.payload)
@@ -586,7 +591,7 @@ class Worker:
         context: TaskContext,
         job: Job,
     ) -> None:
-        timeout = job.timeout_seconds or registration.timeout
+        timeout = registration.timeout
         if timeout is None:
             await registration.handler(payload, context)
             return

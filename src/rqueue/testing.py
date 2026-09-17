@@ -24,7 +24,8 @@ What a recorded call proves
 ---------------------------
 
 * The task name is well-formed and, unless ``require_registered_tasks=False``,
-  actually registered -- so a typo is a test failure, not a runtime surprise.
+  declared or registered -- so a typo is a test failure, not a runtime
+  surprise.
 * The payload is JSON-serializable and within :data:`rqueue.limits
   .MAX_PAYLOAD_BYTES`; the same for ``metadata``.
 * ``dedupe_key`` is paired with an explicit ``on_conflict``, and
@@ -72,7 +73,7 @@ from rqueue.errors import ConfigurationError, UnknownTask, ValidationError
 from rqueue.limits import MAX_ENQUEUE_BATCH
 from rqueue.models import Job, JobRequest, JobState
 from rqueue.queue import ConflictMode, Queue, _as_seconds
-from rqueue.retry import RetryPolicy
+from rqueue.retry import RetryPolicy, RetryPolicyData
 from rqueue.storage import JobInsert
 
 if TYPE_CHECKING:
@@ -130,7 +131,8 @@ class RecordingQueue(Queue):
     persistence step is replaced -- validation still runs through
     :meth:`~rqueue.Queue.build_insert`, and task registration
     (:meth:`~rqueue.Queue.task`, :meth:`~rqueue.Queue.register`) is inherited
-    unchanged, so a test registers the same task names the worker does.
+    unchanged, so a test can declare the same enqueue metadata as a producer
+    or register the same task names the worker does.
 
     There is no pool and no connection. The connection argument of
     :meth:`enqueue` and :meth:`enqueue_many` is accepted, recorded, and
@@ -163,11 +165,11 @@ class RecordingQueue(Queue):
     ) -> None:
         """Build a recording queue.
 
-        ``require_registered_tasks`` (default on) rejects an enqueue for a task
-        name this queue has no registration for, which is how a typo'd name
-        becomes a unit-test failure. Turn it off if the application under test
-        legitimately produces for a task whose handler lives in another
-        deployment.
+        ``require_registered_tasks`` (default on) rejects an enqueue for a
+        task name this queue has neither declared nor registered, which is how
+        a typo'd name becomes a unit-test failure. Turn it off if the
+        application under test legitimately produces for a task whose
+        metadata and handler live in another deployment.
         """
         super().__init__(
             cast("asyncpg.Pool", None),
@@ -256,10 +258,15 @@ class RecordingQueue(Queue):
     def _validate(self, request: JobRequest) -> JobInsert:
         """Run the production validation path and the registry check."""
         spec = self.build_insert(request)
-        if self.require_registered_tasks and spec.task not in self._tasks:
+        if (
+            self.require_registered_tasks
+            and spec.task not in self._tasks
+            and spec.task not in self._declarations
+        ):
             raise UnknownTask(
-                f"no handler registered for task {spec.task!r}; register it on "
-                "this RecordingQueue, or construct it with "
+                f"no declaration or handler registered for task {spec.task!r}; "
+                "declare or register it on this RecordingQueue, or construct it "
+                "with "
                 "require_registered_tasks=False"
             )
         return spec
@@ -284,6 +291,11 @@ class RecordingQueue(Queue):
             concurrency_key=spec.concurrency_key,
             timeout_seconds=spec.timeout_seconds,
             metadata=json.loads(spec.metadata_json),
+            retry_policy=(
+                RetryPolicyData.from_json(spec.retry_policy_json)
+                if spec.retry_policy_json is not None
+                else None
+            ),
         )
         self.recorded.append(
             RecordedEnqueue(request=request, spec=spec, job=job, connection=connection)
