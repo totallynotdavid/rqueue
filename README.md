@@ -43,6 +43,7 @@ $ rqueue --database-url "$DATABASE_URL" migrate
 applied 0001_core
 applied 0002_scheduling
 applied 0003_queue_pause
+applied 0004_retry_policy
 ```
 
 Queue tables live in their own schema, `task_queue` by default, never in your
@@ -97,6 +98,33 @@ except Exception as exc:
 
 A payload that fails to decode becomes a durable *failed* job without
 consuming the retry budget: the same bytes will not decode on a later attempt.
+
+A producer-only process does not need to import the handler. Declare the
+enqueue metadata instead:
+
+```python
+queue = Queue(pool, name="compute")
+queue.declare_task(
+    name="prepare_simulation",
+    retry=RetryPolicy(max_attempts=5, initial_backoff=2.0),
+    timeout=600.0,
+)
+```
+
+The declaration is the single source of truth for the numeric retry and timeout
+defaults; those values are materialized on each job row so an independent
+worker process uses them too. Retryable exception classes and `retry_if` remain
+worker-registration choices and are never loaded from job data; passing either
+to `declare_task()` raises `ConfigurationError`. When a worker
+also registers the task, omitting the numeric options adopts the declaration;
+explicitly supplied values must match it or registration raises
+`ValidationError`. The same rule applies in the other order: a declaration
+with omitted options adopts the existing registration's values, while an
+explicit conflict raises `ValidationError`.
+
+Without `declare_task()`, a plain `register()` keeps its retry policy local to
+the worker, preserving the pre-declaration behavior for existing applications;
+the job's `NULL` retry policy lets the worker use its current backoff settings.
 
 ### 3. Enqueue inside your own transaction
 
@@ -218,10 +246,10 @@ ignored (it defaults to `None`), so no `if TESTING:` branch is needed anywhere.
 
 A recorded call goes through the same `Queue.build_insert` production uses, so
 it proves the call is well-formed and the real queue would accept it: the task
-name is valid *and registered* (a typo fails the test), the payload and
-metadata are JSON and within their size bounds, `dedupe_key` is paired with an
-explicit `on_conflict`, `scheduled_at`/`delay` are not both set, and the
-registered task's retry and timeout defaults were applied.
+name is valid and either declared or registered (a typo fails the test), the
+payload and metadata are JSON and within their size bounds, `dedupe_key` is
+paired with an explicit `on_conflict`, `scheduled_at`/`delay` are not both set,
+and the task's retry and timeout defaults were applied.
 
 It is a recorder, not a simulator. It does not model transactionality, dedupe
 conflict resolution (two calls sharing a `dedupe_key` record two jobs;
