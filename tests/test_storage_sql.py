@@ -54,6 +54,8 @@ def test_no_statement_uses_string_formatting_for_values() -> None:
         "'lease expired before the attempt finished'",
         "'cancelled while leased; lease expired unfinalized'",
         "'cancelled before execution'",
+        "'ConfigurationError'",
+        "'max_attempts'",
         "'worker'",
         "'scheduler'",
         # The queue wildcard is a fixed sentinel, like the state names above,
@@ -91,7 +93,14 @@ def test_resuming_the_wildcard_clears_every_pause() -> None:
 
 
 def test_every_lease_fenced_write_checks_the_token() -> None:
-    fenced = ("complete", "fail_terminal", "cancel_leased", "reschedule", "heartbeat")
+    fenced = (
+        "complete",
+        "fail_terminal",
+        "fail_invalid_policy",
+        "cancel_leased",
+        "reschedule",
+        "heartbeat",
+    )
     for name in fenced:
         sql = statements()[name]
         assert "lease_token = $2" in sql, name
@@ -110,3 +119,10 @@ def test_json_columns_are_cast_on_the_way_in_and_out() -> None:
     assert "$4::text::jsonb" in built["insert_job"]
     assert "payload::text AS payload" in built["get_job"]
     assert "metadata::text AS metadata" in built["get_job"]
+    assert "retry_policy::text AS retry_policy" in built["get_job"]
+
+
+def test_operator_retry_updates_the_persisted_attempt_ceiling() -> None:
+    sql = statements()["retry_terminal"]
+    assert "jsonb_set" in sql
+    assert "ARRAY['max_attempts']" in sql

@@ -9,6 +9,29 @@ import pytest
 
 from rqueue import AlreadyEnqueued, Queue
 from rqueue.models import JobRequest
+from rqueue.retry import RetryPolicy
+
+
+async def test_declared_defaults_are_persisted_without_a_handler(
+    queue: Queue, pool: asyncpg.Pool
+) -> None:
+    """A producer can enqueue with metadata and no worker registration."""
+    queue.declare_task(
+        name="prepare",
+        retry=RetryPolicy(max_attempts=7),
+        timeout=42.0,
+    )
+    assert queue.tasks == {}
+
+    async with pool.acquire() as connection:
+        job = await queue.enqueue(connection, task="prepare")
+
+    stored = await queue.get_job(job.id)
+    assert stored is not None
+    assert stored.max_attempts == 7
+    assert stored.timeout_seconds == 42.0
+    assert stored.retry_policy is not None
+    assert stored.retry_policy.max_attempts == 7
 
 
 async def test_rolled_back_producer_leaves_no_business_row_and_no_job(

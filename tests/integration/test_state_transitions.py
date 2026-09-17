@@ -114,6 +114,93 @@ async def test_handler_and_worker_share_the_retry_decision(
     assert final is not None and final.attempt == 2
 
 
+async def test_worker_uses_persisted_defaults_from_a_producer_queue_instance(
+    queue: Queue, pool: asyncpg.Pool
+) -> None:
+    """Job defaults remain authoritative across producer/worker processes."""
+    attempts: list[int] = []
+
+    queue.declare_task(
+        name="shared",
+        retry=RetryPolicy(
+            max_attempts=4,
+            initial_backoff=0.01,
+            max_backoff=0.02,
+            multiplier=1.5,
+            jitter=0.0,
+        ),
+        timeout=42.0,
+    )
+
+    async def flaky(payload: object, context: TaskContext) -> None:
+        attempts.append(context.attempt)
+        if context.attempt < 4:
+            raise RuntimeError("not yet")
+
+    worker_queue = Queue(pool, name=queue.name)
+    registration = worker_queue.register(
+        name="shared",
+        handler=flaky,
+        retry=RetryPolicy(
+            max_attempts=3,
+            initial_backoff=0.01,
+            retry_on=(RuntimeError,),
+        ),
+    )
+    assert registration.retry.max_attempts == 3
+
+    async with pool.acquire() as connection, connection.transaction():
+        job = await queue.enqueue(connection, task="shared")
+
+    async with running(make_worker(worker_queue)):
+        await eventually(
+            lambda: _in_state(worker_queue, job.id, JobState.SUCCEEDED),
+            message="the worker should use the producer's four-attempt budget",
+        )
+
+    assert attempts == [1, 2, 3, 4]
+    stored = await worker_queue.get_job(job.id)
+    assert stored is not None
+    assert stored.max_attempts == 4
+    assert stored.timeout_seconds == 42.0
+    assert stored.retry_policy is not None
+    assert stored.retry_policy.max_backoff == 0.02
+
+
+async def test_null_job_timeout_uses_worker_registration_fallback(
+    queue: Queue, pool: asyncpg.Pool
+) -> None:
+    """NULL timeout means a worker registration may supply the timeout."""
+
+    async def slow(payload: object, context: TaskContext) -> None:
+        await asyncio.sleep(30)
+
+    worker_queue = Queue(pool, name=queue.name)
+    worker_queue.register(
+        name="legacy_timeout",
+        handler=slow,
+        retry=RetryPolicy(max_attempts=1, initial_backoff=0.01, jitter=0.0),
+        timeout=0.05,
+    )
+    async with pool.acquire() as connection, connection.transaction():
+        job = await queue.enqueue(
+            connection,
+            task="legacy_timeout",
+            max_attempts=1,
+        )
+    assert job.timeout_seconds is None
+
+    async with running(make_worker(worker_queue)):
+        await eventually(
+            lambda: _in_state(worker_queue, job.id, JobState.FAILED),
+            message="the registration timeout should apply to a NULL job timeout",
+        )
+
+    stored = await worker_queue.get_job(job.id)
+    assert stored is not None
+    assert stored.error_type == "TimeoutError"
+
+
 async def test_exhausting_the_budget_is_a_durable_terminal_failure(
     queue: Queue, pool: asyncpg.Pool
 ) -> None:
@@ -371,11 +458,13 @@ async def test_operator_retry_is_the_only_way_out_of_a_terminal_state(
     queue: Queue, pool: asyncpg.Pool, admin: Admin
 ) -> None:
     calls: list[int] = []
-    should_fail = True
+    failures_remaining = 2
 
     async def sometimes(payload: object, context: TaskContext) -> None:
+        nonlocal failures_remaining
         calls.append(context.attempt)
-        if should_fail:
+        if failures_remaining:
+            failures_remaining -= 1
             raise RuntimeError("not yet")
 
     queue.register(
@@ -392,13 +481,15 @@ async def test_operator_retry_is_the_only_way_out_of_a_terminal_state(
             message="the job should fail first",
         )
 
-    should_fail = False
-    revived = await admin.retry_job(job.id)
+    revived = await admin.retry_job(job.id, additional_attempts=2)
     assert revived.state == JobState.PENDING
     # The attempt counter keeps counting; the budget is raised instead, so the
     # immutable attempt history is never overwritten.
     assert revived.attempt == 1
-    assert revived.max_attempts == 2
+    assert revived.max_attempts == 3
+    # No declaration was persisted for this plain registration, so the
+    # worker-local retry policy remains the source of backoff settings.
+    assert revived.retry_policy is None
     assert revived.error_type is None
 
     async with running(make_worker(queue)):
@@ -406,7 +497,7 @@ async def test_operator_retry_is_the_only_way_out_of_a_terminal_state(
             lambda: _in_state(queue, job.id, JobState.SUCCEEDED),
             message="the retried job should run again",
         )
-    assert calls == [1, 2]
+    assert calls == [1, 2, 3]
 
 
 async def _in_state(queue: Queue, job_id: uuid.UUID, expected: JobState) -> bool:

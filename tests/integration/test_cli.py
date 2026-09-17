@@ -80,7 +80,11 @@ def test_status_reports_pending_migrations_with_a_nonzero_exit(
         assert main(["--database-url", admin_dsn, "--schema", schema, "status"]) == 1
         state = json.loads(capsys.readouterr().out)
         assert state["up_to_date"] is False
-        assert state["pending"] == ["0002_scheduling", "0003_queue_pause"]
+        assert state["pending"] == [
+            "0002_scheduling",
+            "0003_queue_pause",
+            "0004_retry_policy",
+        ]
     finally:
         _drop_schema(admin_dsn, schema)
 

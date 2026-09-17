@@ -85,6 +85,39 @@ def test_job_is_built_from_a_row_with_json_text_columns() -> None:
     assert job.state is JobState.PENDING
 
 
+def test_job_ignores_a_malformed_persisted_retry_policy_on_read() -> None:
+    now = datetime.now().astimezone()
+    row = {
+        "id": uuid.uuid4(),
+        "queue": "q",
+        "task": "t",
+        "payload": "{}",
+        "state": "pending",
+        "priority": 0,
+        "attempt": 0,
+        "max_attempts": 3,
+        "scheduled_at": now,
+        "created_at": now,
+        "updated_at": now,
+        "started_at": None,
+        "finished_at": None,
+        "dedupe_key": None,
+        "concurrency_key": None,
+        "worker_id": None,
+        "lease_token": None,
+        "leased_until": None,
+        "heartbeat_at": None,
+        "cancel_requested": False,
+        "timeout_seconds": None,
+        "error_type": None,
+        "error_message": None,
+        "metadata": "{}",
+        "retry_policy": "{}",
+    }
+
+    assert Job.from_row(row).retry_policy is None
+
+
 def test_worker_rejects_impossible_settings(offline_queue: Queue) -> None:
     offline_queue.register(name="t", handler=handler)
     with pytest.raises(ValidationError):
