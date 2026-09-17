@@ -5,10 +5,16 @@ from __future__ import annotations
 import uuid
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, Literal
 
-from rqueue.errors import AlreadyEnqueued, UnknownTask, ValidationError
+from rqueue.errors import (
+    AlreadyEnqueued,
+    ConfigurationError,
+    UnknownTask,
+    ValidationError,
+)
 from rqueue.limits import (
     MAX_CONCURRENCY_KEY_LENGTH,
     MAX_DEDUPE_KEY_LENGTH,
@@ -25,9 +31,16 @@ from rqueue.limits import (
     validate_timeout,
 )
 from rqueue.models import Job, JobRequest, JobState, QueueStats
-from rqueue.retry import RetryPolicy
+from rqueue.retry import RetryPolicy, RetryPolicyData
 from rqueue.storage import JobInsert, Storage
-from rqueue.tasks import PayloadDecoder, TaskHandler, TaskRegistration, identity_decoder
+from rqueue.tasks import (
+    PayloadDecoder,
+    TaskDeclaration,
+    TaskHandler,
+    TaskRegistration,
+    _require_retry_policy,
+    identity_decoder,
+)
 
 if TYPE_CHECKING:
     import asyncpg
@@ -37,6 +50,14 @@ __all__ = ["ConflictMode", "Queue"]
 #: What to do when a dedupe key is already held by an active job. §3 requires
 #: the choice to be explicit per call, so there is no default.
 ConflictMode = Literal["return_existing", "raise"]
+
+
+@dataclass(frozen=True, slots=True)
+class _RegistrationOptions:
+    """Options explicitly supplied to one worker registration."""
+
+    retry: RetryPolicy | None
+    timeout: float | None
 
 
 class Queue:
@@ -89,7 +110,9 @@ class Queue:
         self.pool = pool
         self.storage = Storage(schema)
         self.default_retry = default_retry or RetryPolicy()
+        self._declarations: dict[str, TaskDeclaration] = {}
         self._tasks: dict[str, TaskRegistration] = {}
+        self._registration_options: dict[str, _RegistrationOptions] = {}
 
     @property
     def schema(self) -> str:
@@ -100,6 +123,80 @@ class Queue:
         return self.storage.notify_channel
 
     # ------------------------------------------------------------- registry
+
+    def declare_task(
+        self,
+        *,
+        name: str,
+        retry: RetryPolicy | None = None,
+        timeout: float | None = None,
+    ) -> TaskDeclaration:
+        """Declare enqueue defaults without registering a worker handler.
+
+        A declaration is canonical for a task name. Repeating a declaration
+        with an explicitly different retry policy or timeout raises
+        :class:`~rqueue.errors.ValidationError`; retry_on and retry_if are
+        worker-registration hooks and are rejected here. Otherwise the
+        existing declaration is returned.
+        """
+        declaration = self._declarations.get(name)
+        if declaration is None:
+            registration = self._tasks.get(name)
+            if registration is None:
+                declaration = self._new_declaration(
+                    name=name,
+                    retry=retry,
+                    timeout=timeout,
+                )
+            else:
+                options = self._registration_options[name]
+                if retry is not None and options.retry is not None:
+                    self._check_declaration_options(
+                        registration.declaration,
+                        retry=retry,
+                        timeout=None,
+                        mismatch_subject="the existing registration",
+                    )
+                if timeout is not None and options.timeout is not None:
+                    self._check_declaration_options(
+                        registration.declaration,
+                        retry=None,
+                        timeout=timeout,
+                        mismatch_subject="the existing registration",
+                    )
+                resolved_retry = (
+                    retry
+                    if retry is not None
+                    else RetryPolicyData.from_policy(registration.retry).to_policy()
+                )
+                resolved_timeout = (
+                    timeout if timeout is not None else registration.timeout
+                )
+                declaration = (
+                    self._new_declaration(
+                        name=name,
+                        retry=retry,
+                        timeout=resolved_timeout,
+                    )
+                    if retry is not None
+                    else TaskDeclaration(
+                        name=name,
+                        retry=resolved_retry,
+                        timeout=resolved_timeout,
+                    )
+                )
+                self._adopt_declaration_in_registration(name, declaration)
+            self._declarations[name] = declaration
+            return declaration
+
+        if retry is not None:
+            self._validate_declaration_retry(retry, name=name)
+        self._check_declaration_options(
+            declaration,
+            retry=retry,
+            timeout=timeout,
+        )
+        return declaration
 
     def task(
         self,
@@ -134,19 +231,135 @@ class Queue:
     ) -> TaskRegistration:
         if name in self._tasks:
             raise ValidationError(f"task {name!r} is already registered")
-        registration = TaskRegistration(
-            name=name,
+        validated_timeout = validate_timeout(timeout)
+        declaration = self._declarations.get(name)
+        if declaration is None:
+            registration_retry = self.default_retry if retry is None else retry
+            registration_declaration = TaskDeclaration(
+                name=name,
+                retry=registration_retry,
+                timeout=validated_timeout,
+            )
+        else:
+            self._check_declaration_options(
+                declaration,
+                retry=retry,
+                timeout=timeout,
+            )
+            # Numeric settings belong to the canonical declaration, while
+            # retry_on/retry_if are registration-time hooks owned by this
+            # worker. Omitted retry settings inherit only the producer's
+            # numeric defaults; an explicit policy is wholly worker-local.
+            registration_retry = (
+                retry
+                if retry is not None
+                else RetryPolicyData.from_policy(declaration.retry).apply_to(
+                    self.default_retry
+                )
+            )
+            registration_declaration = TaskDeclaration(
+                name=declaration.name,
+                retry=registration_retry,
+                timeout=declaration.timeout,
+            )
+        registration = TaskRegistration.from_declaration(
+            declaration=registration_declaration,
             handler=handler,
             decoder=decoder,
-            retry=retry or self.default_retry,
-            timeout=validate_timeout(timeout),
         )
         self._tasks[name] = registration
+        self._registration_options[name] = _RegistrationOptions(
+            retry=retry,
+            timeout=validated_timeout if timeout is not None else None,
+        )
         return registration
+
+    def _new_declaration(
+        self,
+        *,
+        name: str,
+        retry: RetryPolicy | None,
+        timeout: float | None,
+    ) -> TaskDeclaration:
+        if retry is None:
+            resolved = RetryPolicyData.from_policy(self.default_retry).to_policy()
+        else:
+            resolved = self._validate_declaration_retry(retry, name=name)
+        return TaskDeclaration(
+            name=name,
+            retry=resolved,
+            timeout=validate_timeout(timeout),
+        )
+
+    def _validate_declaration_retry(
+        self, retry: RetryPolicy | None, *, name: str
+    ) -> RetryPolicy:
+        if retry is None:
+            return self.default_retry
+        resolved = _require_retry_policy(retry, task_name=name)
+        if resolved.retry_if is not None or tuple(resolved.retry_on) != (Exception,):
+            raise ConfigurationError(
+                "declare_task retry may only configure numeric settings; "
+                "retry_on and retry_if belong to register()"
+            )
+        return resolved
+
+    @staticmethod
+    def _check_declaration_options(
+        declaration: TaskDeclaration,
+        *,
+        retry: RetryPolicy | None,
+        timeout: float | None,
+        mismatch_subject: str = "the existing declaration",
+    ) -> None:
+        if retry is not None:
+            retry = _require_retry_policy(retry, task_name=declaration.name)
+            if RetryPolicyData.from_policy(retry) != RetryPolicyData.from_policy(
+                declaration.retry
+            ):
+                raise ValidationError(
+                    f"task {declaration.name!r} retry policy does not match "
+                    f"{mismatch_subject}"
+                )
+        if timeout is not None:
+            validated_timeout = validate_timeout(timeout)
+            if validated_timeout != declaration.timeout:
+                raise ValidationError(
+                    f"task {declaration.name!r} timeout does not match "
+                    f"{mismatch_subject}"
+                )
+
+    def _adopt_declaration_in_registration(
+        self, name: str, declaration: TaskDeclaration
+    ) -> None:
+        registration = self._tasks[name]
+        options = self._registration_options[name]
+        retry = registration.retry
+        if options.retry is None:
+            retry = RetryPolicyData.from_policy(declaration.retry).apply_to(retry)
+        timeout = (
+            registration.timeout if options.timeout is not None else declaration.timeout
+        )
+        if retry == registration.retry and timeout == registration.timeout:
+            return
+        self._tasks[name] = TaskRegistration.from_declaration(
+            declaration=TaskDeclaration(
+                name=name,
+                retry=retry,
+                timeout=timeout,
+            ),
+            handler=registration.handler,
+            decoder=registration.decoder,
+        )
 
     @property
     def tasks(self) -> Mapping[str, TaskRegistration]:
         return dict(self._tasks)
+
+    @property
+    def declarations(self) -> Mapping[str, TaskDeclaration]:
+        """The enqueue metadata declared for this queue's task names."""
+        return dict(self._declarations)
 
     def get_task(self, name: str) -> TaskRegistration:
         try:
@@ -264,14 +477,32 @@ class Queue:
                 datetime.now(UTC) + timedelta(seconds=request.delay)
             )
 
+        declaration = self._declarations.get(task)
         registration = self._tasks.get(task)
+        policy = declaration.retry if declaration else None
         max_attempts = request.max_attempts
-        if max_attempts is None:
-            policy = registration.retry if registration else self.default_retry
-            max_attempts = policy.max_attempts
+        if policy is not None:
+            if max_attempts is not None:
+                policy = replace(policy, max_attempts=max_attempts)
+            else:
+                max_attempts = policy.max_attempts
+        elif max_attempts is None:
+            # The database column is NOT NULL. A plain registration preserves
+            # the old local max-attempts default, while its retry policy stays
+            # NULL so a worker can apply its current local backoff/jitter
+            # settings when it claims the job. A producer-only queue has only
+            # its queue default available here.
+            max_attempts = (
+                registration.retry.max_attempts
+                if registration is not None
+                else self.default_retry.max_attempts
+            )
         timeout = request.timeout
-        if timeout is None and registration is not None:
-            timeout = registration.timeout
+        if timeout is None:
+            if declaration is not None:
+                timeout = declaration.timeout
+            elif registration is not None:
+                timeout = registration.timeout
 
         return JobInsert(
             id=uuid.uuid4(),
@@ -297,6 +528,11 @@ class Queue:
             ),
             timeout_seconds=validate_timeout(timeout),
             metadata_json=validate_metadata(request.metadata),
+            retry_policy_json=(
+                RetryPolicyData.from_policy(policy).to_json()
+                if policy is not None
+                else None
+            ),
             raise_on_conflict=request.on_conflict == "raise",
         )
 
