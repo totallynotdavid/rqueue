@@ -17,17 +17,50 @@ from typing import Any, Final
 
 from rqueue.errors import ValidationError
 
+#: Every bound and validator in this module is part of its public surface:
+#: the bounds are what a caller sizes a batch or a payload against, and the
+#: validators are what turns a violation into a typed error. Listed in full
+#: rather than by what the package itself happens to import today -- an
+#: `__all__` that trails the imports is one the package's own modules reach
+#: around, which is how this one had drifted to a third of the module.
 __all__ = [
+    "MAX_ATTEMPTS_LIMIT",
+    "MAX_BATCH_SIZE",
     "MAX_CONCURRENCY",
+    "MAX_CONCURRENCY_KEY_LENGTH",
     "MAX_DEDUPE_KEY_LENGTH",
+    "MAX_ENQUEUE_BATCH",
     "MAX_ERROR_MESSAGE_LENGTH",
+    "MAX_ERROR_TYPE_LENGTH",
+    "MAX_LEASE_SECONDS",
     "MAX_METADATA_BYTES",
     "MAX_PAYLOAD_BYTES",
+    "MAX_PRIORITY",
+    "MAX_PURGE_LIMIT",
+    "MAX_QUEUE_NAME_LENGTH",
+    "MAX_SCHEDULE_NAME_LENGTH",
+    "MAX_SCHEDULING_HORIZON",
     "MAX_TASK_NAME_LENGTH",
+    "MAX_WORKER_ID_LENGTH",
+    "MIN_LEASE_SECONDS",
+    "MIN_PRIORITY",
     "QUEUE_WILDCARD",
+    "encode_json",
+    "truncate",
+    "validate_batch_size",
+    "validate_concurrency",
     "validate_identifier",
+    "validate_key",
+    "validate_lease_seconds",
+    "validate_max_attempts",
+    "validate_metadata",
+    "validate_name",
     "validate_payload",
+    "validate_priority",
+    "validate_purge_limit",
     "validate_queue_target",
+    "validate_scheduled_at",
+    "validate_timeout",
 ]
 
 #: Largest serialized JSON payload accepted by ``enqueue`` (256 KiB).
@@ -38,6 +71,11 @@ MAX_TASK_NAME_LENGTH: Final = 128
 MAX_QUEUE_NAME_LENGTH: Final = 64
 MAX_WORKER_ID_LENGTH: Final = 128
 MAX_DEDUPE_KEY_LENGTH: Final = 256
+#: Largest batch one purge call may delete. Mirrored by the bound the
+#: ``purge_terminal_jobs`` routine enforces for itself (migration 0006),
+#: which is the boundary that actually holds -- this only turns an
+#: out-of-range argument into a typed error before the statement is sent.
+MAX_PURGE_LIMIT: Final = 100_000
 MAX_CONCURRENCY_KEY_LENGTH: Final = 256
 MAX_SCHEDULE_NAME_LENGTH: Final = 128
 #: Error text is truncated to this many characters before it reaches a row.
@@ -205,6 +243,16 @@ def validate_concurrency(value: int) -> int:
     if not 1 <= value <= MAX_CONCURRENCY:
         raise ValidationError(
             f"concurrency must be between 1 and {MAX_CONCURRENCY} (got {value})"
+        )
+    return value
+
+
+def validate_purge_limit(value: int) -> int:
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise ValidationError("purge limit must be an int")
+    if not 1 <= value <= MAX_PURGE_LIMIT:
+        raise ValidationError(
+            f"purge limit must be between 1 and {MAX_PURGE_LIMIT} (got {value})"
         )
     return value
 

@@ -124,6 +124,9 @@ class Scheduler:
         self.logger = logger or _LOGGER
         self._storage = queue.storage
         self._stop = asyncio.Event()
+        #: Queues this scheduler has already reported it cannot retract, so the
+        #: warning is not repeated on every tick. See `_report_unretractable`.
+        self._unretractable: frozenset[str] = frozenset()
 
     # ------------------------------------------------------------- lifecycle
 
@@ -176,19 +179,40 @@ class Scheduler:
 
         ``now`` is injectable so a test can advance the clock instead of
         waiting a real cron period; production leaves it unset.
+
+        The heartbeat is written per queue this tick actually serves, and for
+        no others. One scheduler deployment can serve several queues (see the
+        class docstring), so its liveness is a fact about each of them, and a
+        readiness probe for a queue this scheduler feeds has to find it.
+
+        A tick with nothing enabled to fire writes no heartbeat at all. There
+        is no queue to claim liveness for -- this handle's own queue is a
+        default for schedules that do not name one, not a queue this scheduler
+        is feeding -- and claiming it would be both untrue and, for a role not
+        granted that queue, an ``InsufficientPrivilegeError`` on every tick,
+        which :meth:`run` would retry forever. So a scheduler with no enabled
+        schedules reports as unavailable, because it is: nothing is scheduling
+        anything.
+
+        The heartbeats for queues this tick does *not* serve are dropped in the
+        same breath, which is what makes the two statements above one answer
+        rather than two. Disabling the last schedule on a queue is an ordinary
+        operator action taken against a scheduler that keeps running, so the
+        row it leaves behind is not a dead process's -- nothing will overwrite
+        it, and until the staleness window expires a readiness probe for that
+        queue answers "live, and this is the instance feeding it" about a
+        scheduler that is feeding it nothing. The window exists for a process
+        that died and cannot speak; a process that is still ticking says so
+        itself.
         """
         moment = now or datetime.now(UTC)
         created: list[Job] = []
         async with self.queue.pool.acquire() as connection:
-            await self._storage.record_runtime_heartbeat(
-                connection,
-                kind="scheduler",
-                instance=self.scheduler_id,
-                queue=self.queue.name,
-            )
             schedules = await self._storage.list_schedules(
                 connection, enabled_only=True
             )
+            serving = sorted({schedule.queue for schedule in schedules})
+            await self._reconcile_heartbeats(connection, serving)
             for schedule in schedules:
                 created.extend(
                     await self.fire_due(schedule, now=moment, connection=connection)
@@ -196,6 +220,82 @@ class Scheduler:
         if created:
             self.metrics.counter("rqueue.schedule.fired", len(created))
         return created
+
+    async def _reconcile_heartbeats(
+        self, connection: asyncpg.Connection, serving: list[str]
+    ) -> None:
+        """Claim the queues this tick serves, and retract the ones it does not.
+
+        One transaction, and the writes before the retraction: a readiness
+        probe landing mid-reconciliation must never see a queue this scheduler
+        still serves without a heartbeat.
+
+        The retraction is asked for only when there is something to retract,
+        which is what keeps it off the ordinary tick. It needs ``DELETE`` on
+        ``runtime_heartbeats``, and the ``SCHEDULE`` capability only started
+        granting that alongside 0008 -- a schema migration cannot re-grant
+        anything to a role that already exists, so a scheduler role provisioned
+        before it has the old grant set until an operator re-provisions it.
+        Issuing the statement unconditionally would fail such a role on *every*
+        tick, forever, over a row it had no reason to touch.
+
+        When it genuinely cannot retract, the claim is left to go stale rather
+        than the tick to fail: scheduling work is the scheduler's job and a
+        missing grant is not a reason to stop doing it. That is the behaviour
+        from before the retraction existed, so the cost is a readiness answer
+        that lags by the staleness window -- said once per distinct set, with
+        the remedy, instead of once per tick.
+        """
+        async with connection.transaction():
+            for name in serving:
+                await self._storage.record_runtime_heartbeat(
+                    connection,
+                    kind="scheduler",
+                    instance=self.scheduler_id,
+                    queue=name,
+                )
+            stale = await self._storage.stale_heartbeat_queues(
+                connection,
+                kind="scheduler",
+                instance=self.scheduler_id,
+                keep=serving,
+            )
+            if not stale:
+                self._unretractable = frozenset()
+                return
+            try:
+                # A savepoint, so a refusal costs the retraction and not the
+                # heartbeats written above it.
+                async with connection.transaction():
+                    await self._storage.clear_runtime_heartbeats(
+                        connection,
+                        kind="scheduler",
+                        instance=self.scheduler_id,
+                        keep=serving,
+                    )
+            except asyncpg.InsufficientPrivilegeError:
+                self._report_unretractable(stale)
+                return
+        self._unretractable = frozenset()
+
+    def _report_unretractable(self, stale: list[str]) -> None:
+        """Say it once per distinct set, not once per tick.
+
+        The rows stay until something can delete them, so the condition does
+        not clear on its own and an unconditional log would repeat for as long
+        as the process runs.
+        """
+        if frozenset(stale) == self._unretractable:
+            return
+        self._unretractable = frozenset(stale)
+        self.logger.warning(
+            "rqueue: scheduler %s cannot retract its heartbeat for %s: no DELETE "
+            "on runtime_heartbeats. Readiness will report this scheduler as "
+            "feeding those queues until the staleness window expires. Re-run "
+            "provision_role for this scheduler's role to grant it.",
+            self.scheduler_id,
+            ", ".join(stale),
+        )
 
     async def fire_due(
         self,

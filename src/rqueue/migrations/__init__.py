@@ -13,13 +13,12 @@ import re
 import zlib
 from dataclasses import dataclass
 from importlib import resources
-from typing import TYPE_CHECKING, Final
+from typing import Final
+
+import asyncpg
 
 from rqueue.errors import MigrationError
 from rqueue.limits import validate_identifier
-
-if TYPE_CHECKING:
-    import asyncpg
 
 __all__ = [
     "Migration",
@@ -183,6 +182,18 @@ def _verify_forward_only(
             )
 
 
+def _failure(migration: Migration, exc: asyncpg.PostgresError) -> str:
+    """Name the migration that failed, and let PostgreSQL say why.
+
+    A migration can fail deliberately -- 0005 refuses to run while the previous
+    release's workers are still heartbeating -- so this is a message an
+    operator has to act on, not a traceback. asyncpg's rendering already
+    carries the DETAIL and HINT such a message is written into; only the
+    identity of the failing file is missing.
+    """
+    return f"migration {migration.version:04d}_{migration.name} failed: {exc}"
+
+
 async def migrate(
     connection: asyncpg.Connection,
     *,
@@ -218,17 +229,23 @@ async def migrate(
                 f"INSERT INTO {schema}.schema_migrations (version, name, checksum) "
                 "VALUES ($1, $2, $3)"
             )
-            if migration.transactional:
-                async with connection.transaction():
+            try:
+                if migration.transactional:
+                    async with connection.transaction():
+                        await connection.execute(sql)
+                        await connection.execute(
+                            record,
+                            migration.version,
+                            migration.name,
+                            migration.checksum,
+                        )
+                else:
                     await connection.execute(sql)
                     await connection.execute(
                         record, migration.version, migration.name, migration.checksum
                     )
-            else:
-                await connection.execute(sql)
-                await connection.execute(
-                    record, migration.version, migration.name, migration.checksum
-                )
+            except asyncpg.PostgresError as exc:
+                raise MigrationError(_failure(migration, exc)) from exc
             performed.append(migration)
         return tuple(performed)
     finally:

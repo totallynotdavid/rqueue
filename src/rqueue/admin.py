@@ -114,6 +114,17 @@ class Admin:
 
         Attempt records and occurrence rows are removed with their job by
         ``ON DELETE CASCADE``, so retention has one knob rather than three.
+
+        The delete itself is done by the ``purge_terminal_jobs`` routine, which
+        re-derives every bound for itself, so this is the operation
+        :attr:`~rqueue.Capability.PURGE` authorizes -- a role holding it has no
+        ``DELETE`` on ``jobs`` and does not need one. Naming a queue is the
+        cheaper call; omitting it purges each queue that has anything to purge,
+        spending ``limit`` across them as a single budget.
+
+        Only terminal states may be named. Asking for a live one raises rather
+        than quietly matching nothing, because a caller that asked for the
+        wrong thing should learn that it did.
         """
         cutoff = (now or datetime.now(UTC)) - retention
         state_values = (

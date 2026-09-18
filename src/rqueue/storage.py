@@ -32,7 +32,14 @@ from rqueue.errors import (
     ScheduleNotFound,
     ValidationError,
 )
-from rqueue.limits import MAX_ERROR_MESSAGE_LENGTH, truncate, validate_identifier
+from rqueue.limits import (
+    MAX_ERROR_MESSAGE_LENGTH,
+    MAX_QUEUE_NAME_LENGTH,
+    truncate,
+    validate_identifier,
+    validate_name,
+    validate_purge_limit,
+)
 from rqueue.models import (
     ACTIVE_STATES,
     TERMINAL_STATES,
@@ -238,6 +245,7 @@ class Storage:
                 if key is not None:
                     acquired = await connection.fetchval(
                         self._sql.acquire_slot,
+                        queue,
                         key,
                         candidate["id"],
                         token,
@@ -559,12 +567,142 @@ class Storage:
         states: Sequence[str] = TERMINAL_STATES,
         limit: int = 10000,
     ) -> int:
-        return int(
-            await connection.fetchval(
-                self._sql.purge, queue, older_than, list(states), limit
+        """Delete terminal jobs through the routine that bounds the delete.
+
+        Not a ``DELETE`` statement: the deleting is done by
+        ``purge_terminal_jobs`` (migration 0006), which re-derives queue,
+        terminal state, cutoff, and batch size for itself. That is what lets a
+        role holding nothing but :attr:`~rqueue.Capability.PURGE` run this --
+        it has no ``DELETE`` on ``jobs`` and is not meant to.
+
+        The routine takes one queue, because "every queue" is precisely the
+        unbounded delete it exists to refuse. ``queue=None`` therefore fans out
+        over the queues that have something to purge -- but a fan-out is only
+        oldest-first if something stops the first queue swallowing the budget,
+        and visiting queues in age order is not that something. So the cutoff
+        is tightened first: find the age of the ``limit``-th oldest candidate
+        in the schema, and hand *that* to every queue instead of the caller's
+        cutoff. Each queue then deletes only rows older than everything the
+        budget cannot reach, in any visiting order, and the invariant holds by
+        construction rather than by luck.
+
+        That bound is also what keeps the cost proportional to ``limit``. The
+        statement it replaced stopped after ``limit`` index entries; a fan-out
+        that asks "which queues have anything at all?" against the caller's
+        cutoff reads the entire retention backlog, which for a nightly cron
+        against a multi-million-row table is the whole table, every pass, to
+        delete ten thousand rows.
+
+        The arguments are checked here as well as inside the routine. The
+        routine is still the boundary -- it is what a hand-written call has to
+        get past -- but a fan-out that happens to match no queue would never
+        reach it, and an invalid cutoff or a live state would come back as a
+        quiet ``0`` instead of an error.
+
+        The queue goes through :func:`~rqueue.limits.validate_name` rather than
+        :func:`~rqueue.limits.validate_queue_target`, so ``'*'`` is a name that
+        does not exist rather than the wildcard pause and resume accept. "Every
+        queue" is spelled ``queue=None`` here, and spelling it ``'*'`` has to
+        fail as the typed error every other bad name gives -- the routine's own
+        refusal arrives as a raw ``asyncpg`` exception, which is a traceback out
+        of ``rqueue purge --queue '*'`` rather than a message.
+        """
+        chosen = validate_purge_limit(limit)
+        wanted = _validate_purge_states(states)
+        older_than = await _validate_purge_cutoff(connection, older_than)
+        if queue is not None:
+            named = validate_name(
+                queue, kind="queue name", max_length=MAX_QUEUE_NAME_LENGTH
             )
-            or 0
+            return await self._purge_one(
+                connection,
+                queue=named,
+                older_than=older_than,
+                states=wanted,
+                limit=chosen,
+            )
+
+        horizon = await self._purge_horizon(
+            connection, states=wanted, older_than=older_than, limit=chosen
         )
+        removed = 0
+        queues = await connection.fetch(self._sql.purge_queues, wanted, horizon, chosen)
+        for row in queues:
+            if removed >= chosen:
+                break
+            removed += await self._purge_one(
+                connection,
+                queue=row["queue"],
+                older_than=horizon,
+                states=wanted,
+                limit=chosen - removed,
+            )
+        return removed
+
+    async def _purge_horizon(
+        self,
+        connection: asyncpg.Connection,
+        *,
+        states: list[str],
+        older_than: datetime,
+        limit: int,
+    ) -> datetime:
+        """The cutoff that bounds a whole-schema purge to its oldest rows.
+
+        Everything at or before the ``limit``-th oldest candidate is, by
+        definition, among the ``limit`` oldest -- so purging each queue at that
+        cutoff spends the budget on those rows and no others, whatever order
+        the queues are visited in. One row further and the cutoff would admit a
+        row outside the budget, which the fan-out could then delete in place of
+        an older one on a queue it has not reached yet.
+
+        *At or before*, inclusive, which is the whole subtlety. Jobs finished
+        in one transaction share a ``finished_at``, so a tie group routinely
+        straddles the boundary: excluding it drops rows that are inside the
+        budget and just as old as rows being deleted, and a purge sized to keep
+        up quietly stops keeping up. The statement therefore returns the
+        boundary instant plus one microsecond, which the routine's strict
+        ``<`` turns into "every row of that age, and nothing newer". Rows of
+        identical age have no oldest-first order between them, so which of them
+        the budget reaches does not matter -- only how many.
+
+        With no boundary row there are fewer candidates than the budget and all
+        of them are eligible, so the caller's own cutoff is returned. The queue
+        scan that follows carries the budget as its own limit either way, so it
+        stays bounded here and, more to the point, stays bounded when the tie
+        group this cutoff admits is larger than the budget by any margin.
+        """
+        boundary: datetime | None = await connection.fetchval(
+            self._sql.purge_horizon, states, older_than, limit
+        )
+        return older_than if boundary is None else boundary
+
+    async def _purge_one(
+        self,
+        connection: asyncpg.Connection,
+        *,
+        queue: str,
+        older_than: datetime,
+        states: list[str],
+        limit: int,
+    ) -> int:
+        """One queue's bounded delete, with the routine's refusals typed.
+
+        The routine authorizes its caller, and a role that is neither the
+        schema owner, a superuser, nor granted the queue is refused. That is a
+        configuration answer -- add the grant, or run as an identity that has
+        it -- so it reaches the caller as one, instead of as a driver error the
+        CLI has no branch for and prints as a traceback.
+        """
+        try:
+            return int(
+                await connection.fetchval(
+                    self._sql.purge, queue, states, older_than, limit
+                )
+                or 0
+            )
+        except asyncpg.InsufficientPrivilegeError as exc:
+            raise ConfigurationError(str(exc)) from exc
 
     # -------------------------------------------------------------- schedules
 
@@ -654,6 +792,7 @@ class Storage:
                     self._sql.insert_occurrence,
                     schedule_id,
                     occurrence_at,
+                    spec.queue,
                     spec.id,
                     fired_by,
                 )
@@ -676,12 +815,60 @@ class Storage:
         *,
         kind: str,
         instance: str,
-        queue: str | None,
+        queue: str,
         metadata_json: str = "{}",
     ) -> None:
+        """Record that ``instance`` is alive on ``queue``.
+
+        The queue is required, not merely recorded: it is part of the row's
+        key, because one instance id can serve different queues in different
+        processes and each is its own liveness fact.
+        """
         await connection.execute(
             self._sql.record_runtime_heartbeat, kind, instance, queue, metadata_json
         )
+
+    async def clear_runtime_heartbeats(
+        self,
+        connection: asyncpg.Connection,
+        *,
+        kind: str,
+        instance: str,
+        keep: Sequence[str],
+    ) -> int:
+        """Drop this instance's heartbeats for every queue outside ``keep``.
+
+        Liveness is a claim about the present, and the staleness window is
+        there for a process that *died* -- it cannot retract anything, so time
+        has to. A process that is still running and has merely stopped serving
+        a queue can retract it, and until it does, a readiness probe for that
+        queue keeps answering "yes, and this is the instance feeding it" for
+        the width of that window.
+        """
+        status = await connection.execute(
+            self._sql.clear_runtime_heartbeats, kind, instance, list(keep)
+        )
+        return int(status.rsplit(" ", 1)[-1])
+
+    async def stale_heartbeat_queues(
+        self,
+        connection: asyncpg.Connection,
+        *,
+        kind: str,
+        instance: str,
+        keep: Sequence[str],
+    ) -> list[str]:
+        """The queues :meth:`clear_runtime_heartbeats` would retract.
+
+        Asking first is what makes the retraction cost a privilege only when
+        there is something to retract. A component that never changes the set
+        of queues it serves -- the overwhelmingly common case, every tick of
+        every deployment -- then issues no ``DELETE`` at all.
+        """
+        rows = await connection.fetch(
+            self._sql.stale_heartbeat_queues, kind, instance, list(keep)
+        )
+        return [row["queue"] for row in rows]
 
     async def live_instances(
         self,
@@ -727,6 +914,59 @@ class Storage:
     ) -> bool:
         """Whether ``queue`` is paused, by its own row or by the wildcard."""
         return bool(await connection.fetchval(self._sql.is_queue_paused, queue))
+
+
+def _validate_purge_states(states: Sequence[str]) -> list[str]:
+    """Terminal states only, and at least one.
+
+    ``purge_terminal_jobs`` refuses anything else, but a fan-out over zero
+    queues never calls it, so the same rule is applied before the first
+    statement rather than only inside the last one.
+    """
+    wanted = [str(state) for state in states]
+    if not wanted:
+        raise ValidationError("purge needs at least one terminal state")
+    live = sorted(set(wanted) - set(TERMINAL_STATES))
+    if live:
+        raise ValidationError(
+            f"purge may only delete terminal jobs; {', '.join(live)} "
+            f"{'is' if len(live) == 1 else 'are'} not terminal"
+        )
+    return wanted
+
+
+async def _validate_purge_cutoff(
+    connection: asyncpg.Connection, older_than: datetime
+) -> datetime:
+    """Reject a cutoff the routine would reject, using the routine's clock.
+
+    ``purge_terminal_jobs`` compares against PostgreSQL's ``now()``. Checking
+    here against the client's clock instead means the two disagree by exactly
+    the skew between them, and a caller inside that window -- ``retention`` of
+    zero or near it is the realistic way in -- passes this check and then takes
+    a raw ``PostgresError`` from the routine, which is the failure this
+    validator exists to prevent.
+
+    ``now()`` is the transaction timestamp, so inside a transaction this reads
+    the same instant the routine will. Outside one it reads slightly earlier,
+    which can only make this check stricter than the one it stands in for.
+
+    A naive cutoff is refused rather than assumed to be UTC, which is the
+    convention :func:`~rqueue.limits.validate_scheduled_at` already sets for
+    every caller-supplied instant. Guessing the offset would silently move the
+    cutoff by the caller's own offset and delete rows they did not mean to
+    delete; without the check it is a raw ``TypeError`` from comparing it
+    against an aware ``now()``.
+    """
+    if older_than.tzinfo is None or older_than.utcoffset() is None:
+        raise ValidationError("purge needs a timezone-aware cutoff")
+    server_now: datetime = await connection.fetchval("SELECT now()")
+    if older_than > server_now:
+        raise ValidationError(
+            f"purge needs a cutoff in the past (got {older_than.isoformat()}, "
+            f"database clock reads {server_now.isoformat()})"
+        )
+    return older_than
 
 
 class _Statements:
@@ -799,15 +1039,25 @@ class _Statements:
             WHERE id = $1 AND state = 'pending'
         """
 
+        # The slot key is scoped to its queue (0005_queue_scoped_runtime.sql),
+        # the same scoping dedupe_key has always had, so the queue is part of
+        # both the inserted row and the conflict arbiter.
         self.acquire_slot = f"""
-            INSERT INTO {slots} (key, job_id, lease_token, worker_id, leased_until)
-            VALUES ($1, $2, $3, $4, now() + make_interval(secs => $5))
-            ON CONFLICT (key) DO UPDATE
+            INSERT INTO {slots} (
+                queue, key, job_id, lease_token, worker_id, leased_until
+            )
+            VALUES ($1, $2, $3, $4, $5, now() + make_interval(secs => $6))
+            ON CONFLICT (queue, key) DO UPDATE
             SET job_id = EXCLUDED.job_id,
                 lease_token = EXCLUDED.lease_token,
                 worker_id = EXCLUDED.worker_id,
                 acquired_at = now(),
-                leased_until = EXCLUDED.leased_until
+                leased_until = EXCLUDED.leased_until,
+                -- Taking over an expired slot takes over the ownership with
+                -- it (0010_slot_ownership.sql). Left alone, the row would
+                -- still name the holder this one displaced, and the new
+                -- holder could not release the slot it is holding.
+                role_name = current_user
             WHERE concurrency_slots.leased_until <= now()
             RETURNING key
         """
@@ -1098,19 +1348,67 @@ class _Statements:
             RETURNING {job_cols}
         """
 
+        # Retention deletes through the SECURITY DEFINER routine from
+        # migration 0006, never through a DELETE here. The routine is the
+        # safety boundary -- it re-checks queue, terminal state, cutoff, and
+        # batch size -- so this statement carries no predicates of its own to
+        # get wrong, and a PURGE-only role can run it with no DELETE grant.
         self.purge = f"""
-            WITH doomed AS (
-                SELECT id FROM {jobs}
-                WHERE ($1::text IS NULL OR queue = $1)
-                  AND state = ANY($3::text[])
+            SELECT {schema}.purge_terminal_jobs($1, $2::text[], $3, $4)
+        """
+
+        # The cutoff a whole-schema purge hands every queue: one tick past the
+        # age of the budget's last row -- `OFFSET $3 - 1` is that row, since
+        # the offset is zero-based. `Storage._purge_horizon` explains why it is
+        # inclusive; the arithmetic is here because the tick is a property of
+        # the column, not of the caller -- timestamptz resolves to the
+        # microsecond, so `+ 1us` is the smallest value that admits every row
+        # sharing that instant and no row after it. The routine compares with a
+        # strict `<`, and that comparison is fixed: migration 0006 is
+        # checksummed and forward-only.
+        #
+        # A LIMIT-ed index scan on jobs_retention_idx, so the work is
+        # proportional to the budget rather than to the backlog behind it --
+        # the property the single ordered DELETE had, and the reason this is
+        # not simply `SELECT min(finished_at) ... GROUP BY queue`.
+        self.purge_horizon = f"""
+            SELECT finished_at + interval '1 microsecond'
+            FROM {jobs}
+            WHERE state = ANY($1::text[])
+              AND finished_at IS NOT NULL
+              AND finished_at < $2
+            ORDER BY finished_at
+            OFFSET $3 - 1 LIMIT 1
+        """
+
+        # Which queues hold rows inside that horizon, oldest queue first.
+        #
+        # The grouping runs over a LIMIT-ed scan rather than over the horizon
+        # alone, because the horizon is inclusive of the tie group that
+        # straddles it and a tie group has no size bound -- one transaction
+        # finishing a hundred thousand jobs gives them all one `finished_at`,
+        # and `finished_at < $2` then matches every one of them. Grouping the
+        # whole tie group to learn which queues it touches is the full-backlog
+        # read the horizon exists to prevent.
+        #
+        # Reading only the `limit` oldest rows finds every queue the budget can
+        # reach and no others: those rows are themselves under the horizon, so
+        # the queues holding them hold at least `limit` deletable rows between
+        # them, and a queue absent from them has nothing the budget could get
+        # to before something older. The tie group stays fully eligible -- that
+        # is the horizon's job, and `purge_terminal_jobs` still deletes from it
+        # up to the budget; this statement only decides where to look.
+        self.purge_queues = f"""
+            SELECT queue FROM (
+                SELECT queue, finished_at FROM {jobs}
+                WHERE state = ANY($1::text[])
+                  AND finished_at IS NOT NULL
                   AND finished_at < $2
                 ORDER BY finished_at
-                LIMIT $4
-            ),
-            removed AS (
-                DELETE FROM {jobs} WHERE id IN (SELECT id FROM doomed) RETURNING id
-            )
-            SELECT count(*)::int FROM removed
+                LIMIT $3
+            ) AS budget
+            GROUP BY queue
+            ORDER BY min(finished_at)
         """
 
         self.upsert_schedule = f"""
@@ -1153,25 +1451,69 @@ class _Statements:
         """
 
         self.insert_occurrence = f"""
-            INSERT INTO {occurrences} (schedule_id, occurrence_at, job_id, fired_by)
-            VALUES ($1, $2, $3, $4)
+            INSERT INTO {occurrences} (
+                schedule_id, occurrence_at, queue, job_id, fired_by
+            )
+            VALUES ($1, $2, $3, $4, $5)
         """
 
         self.occurrence_count = f"""
             SELECT count(*)::int FROM {occurrences} WHERE schedule_id = $1
         """
 
+        # The queue is part of the key (0005_queue_scoped_runtime.sql), not a
+        # payload column: a heartbeat is one component's liveness on one queue,
+        # and an instance id -- a pod name, a hostname, a container ordinal --
+        # says nothing about which. With (kind, instance) alone, a queue-scoped
+        # role's upsert would conflict with a row its own policy hides.
+        # `role_name` is never named here: it defaults to `current_user`
+        # (0008_heartbeat_ownership.sql), which is the point -- a liveness claim
+        # records the identity its writer authenticated as, not one it chose.
+        # The arbiter has to match the unique index, so it names the column even
+        # though the statement does not supply it.
         self.record_runtime_heartbeat = f"""
             INSERT INTO {beats} (kind, instance, queue, updated_at, metadata)
             VALUES ($1, $2, $3, now(), $4::text::jsonb)
-            ON CONFLICT (kind, instance) DO UPDATE
-            SET queue = EXCLUDED.queue,
-                updated_at = now(),
+            ON CONFLICT (kind, instance, queue, role_name) DO UPDATE
+            SET updated_at = now(),
                 metadata = EXCLUDED.metadata
         """
 
+        # The other half of the upsert above: a component's heartbeats are the
+        # queues it is serving *now*, so the ones it has stopped serving have
+        # to go, not merely age out. Scoped to one instance, because a row for
+        # another instance of the same kind is another process's liveness and
+        # not this one's to retract. An empty `keep` deletes every row this
+        # instance holds -- `queue <> ALL('{}')` is true of all of them --
+        # which is exactly right for a component that is now serving nothing.
+        self.clear_runtime_heartbeats = f"""
+            DELETE FROM {beats}
+            WHERE kind = $1 AND instance = $2 AND role_name = current_user
+              AND queue <> ALL($3::text[])
+        """
+
+        # Exactly the rows the DELETE above would remove, so a caller can find
+        # out whether it has anything to retract before asking for the
+        # privilege to retract it. Needs SELECT and nothing more, which every
+        # role that writes a heartbeat already holds -- which is what keeps a
+        # role provisioned before DELETE joined the grant set from failing on a
+        # tick with nothing to do. The `role_name` predicate is repeated rather
+        # than left to the policy so the two statements have the same reach for
+        # the schema owner, who bypasses it.
+        self.stale_heartbeat_queues = f"""
+            SELECT queue FROM {beats}
+            WHERE kind = $1 AND instance = $2 AND role_name = current_user
+              AND queue <> ALL($3::text[])
+            ORDER BY queue
+        """
+
+        # DISTINCT because the key is per queue (0005_queue_scoped_runtime.sql)
+        # and one instance can be alive on several of them: an unfiltered probe
+        # asks "which schedulers are alive?", and answering with the same id
+        # once per queue it serves would make a readiness report count
+        # deployments that do not exist.
         self.live_instances = f"""
-            SELECT instance FROM {beats}
+            SELECT DISTINCT instance FROM {beats}
             WHERE kind = $1 AND updated_at >= $2
               AND ($3::text IS NULL OR queue = $3)
             ORDER BY instance
