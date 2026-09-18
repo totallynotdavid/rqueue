@@ -63,7 +63,10 @@ than adopting:
 ## 2. Platform and dependencies
 
 - Python 3.13+.
-- PostgreSQL 14+ only.
+- PostgreSQL 14+ only. Where a statement exists only in a later release, the
+  server version decides which form is issued: role-membership `REVOKE ...
+  GRANTED BY` is 16+, and is both unavailable and unnecessary before it, since
+  14 and 15 record one grantor per membership and a bare `REVOKE` removes it.
 - `asyncpg` is the sole database driver and the only required runtime
   dependency.
 - The public API is asyncio-native. No synchronous API, psycopg adapter,
@@ -340,6 +343,38 @@ alternative seen in prior art. Three approaches were compared directly:
 - Migration execution is an explicit CLI command and takes an advisory lock.
   Migrations are forward-only, transactional where PostgreSQL permits, and
   tested from an empty database and the immediately previous release.
+- A migration that the previous release's *running* code cannot survive must
+  detect that code and refuse, rather than apply and break it. Runtime
+  liveness is already recorded, so "is the old fleet still up?" is a question
+  the database can answer; the refusal names the required order, in the
+  deployment's own schema rather than the default one. What such a check can
+  prove must be stated exactly -- absence of a trace is not absence of a
+  process -- and the gap it leaves named as the drain window. Testing "from
+  the previous release" therefore means starting at the previous migration and
+  exercising the previous release's own statements across the transition, not
+  starting at the new one.
+- Each such migration carries its own check. A body runs exactly once, so a
+  database that applied an earlier one in an earlier release never re-executes
+  it, and a check inherited by comment holds only for a database installed
+  from empty in a single `migrate`. Where a migration also strands rows the
+  running fleet owns, the check covers those as well -- and the liveness half
+  of it reads the table written on a timer, not the one the migration is
+  changing: a component idle between units of work leaves no trace in the
+  latter.
+- Retention is oldest-first across the whole schema, not only within one
+  queue; a bounded purge reads work proportional to its limit rather than to
+  the backlog behind it; and it delivers that limit when the rows exist. All
+  three follow from bounding the delete by the age of the budget's last row,
+  inclusive of every row sharing that instant -- jobs finished in one
+  transaction share a `finished_at`, so a tie group routinely straddles the
+  boundary. None of them follows from the order queues are visited in, since
+  one queue can hold the oldest row and enough newer ones to exhaust the
+  budget by itself. The cost bound needs its own limit as well as that one: a
+  tie group has no size bound, so the age of the budget's last row does not
+  bound how many rows share it, and every scan taken against that cutoff must
+  carry the budget too.
+- Purging by queue and purging the whole schema are the same operation with
+  one argument different. Given identical data they delete identically.
 - Expose structured metrics/logging hooks for queue depth, oldest ready job,
   claim latency, handler duration, retry/failure count, expired leases, and
   notification/poll wakeups. Do not require a metrics vendor.
@@ -356,7 +391,280 @@ alternative seen in prior art. Three approaches were compared directly:
   isolated in the storage implementation.
 - Support PostgreSQL roles with least privilege: API producers may enqueue and
   inspect only their allowed queues; workers may claim/transition their queues;
-  migration role owns DDL.
+  migration role owns DDL. A worker capability grants no `INSERT` on `jobs` --
+  claiming work and creating it are separate authorities, and a role that needs
+  both asks for both capabilities.
+- Retention deletion is a capability of its own, and it is not a table-wide
+  `DELETE`. The purge capability grants `EXECUTE` on a `SECURITY DEFINER`
+  routine that re-derives queue, terminal state, age cutoff, and batch size
+  from its own arguments; the routine is the safety boundary, so a crafted call
+  cannot reach a non-terminal job, another queue's jobs, or an unbounded batch.
+  The package's own retention API goes through that routine and no other path,
+  so holding the capability is sufficient to run it -- a capability whose only
+  caller is hand-written SQL is not one. The corollary is a breaking change to
+  document, not to soften: a privilege alone no longer authorizes retention,
+  so an operator identity that is neither the schema owner nor queue-granted
+  loses an ability it had.
+- A bound duplicated between Python and a migration must be tested to agree.
+  Migrations are checksummed and forward-only, so the SQL side can never be
+  corrected afterwards; an unchecked pair silently degrades a typed error into
+  a raw database one.
+- Ownership is not a grant and cannot be pruned like one. Provisioning must
+  refuse a role that owns the schema, the database, or an object in the
+  schema: an owner re-grants itself anything the moment it is narrowed. "An
+  object" means whatever catalog it lives in, not the handful a grant model
+  thinks about -- relations, routines, types, collations, conversions,
+  operators and their classes and families, text-search dictionaries and
+  configurations, extended statistics, extensions. A check written catalog by
+  catalog is a list that falls behind the server, so the ownership record
+  PostgreSQL keeps for every object alike is the one to read.
+- The capability grant table belongs to the release, and the schema version
+  does not track it. `migrate` moves the schema; the privileges an existing
+  role holds only move when `provision_role` runs again, so every release that
+  changes the table states what an un-reprovisioned role loses. A migration may
+  repair what it can derive: a capability that implies a privilege nothing else
+  grants is an exact fingerprint, and adding on one is safe because the roles
+  it matches already hold the neighbouring privileges. Removing on one is not,
+  because a privilege two capabilities both confer is indistinguishable, and
+  the capability set is the caller's -- never recorded, so never the
+  database's to infer. A change the fingerprint cannot repair is documented
+  with its failure mode; one that leaves a component unable to work at all
+  rather than degraded is repaired.
+- Provisioning a role is one transaction. It issues a dozen statements across
+  the role, the database, the schema, each table, each routine, and the queue
+  grants; a failure part way through must leave the role exactly as it was
+  rather than existing, able to log in, and holding whichever half of the
+  capability set was applied first.
+- Narrowing a role means every privilege class, not the ones a grant model
+  happens to use. Tables, routines, and sequences are separate classes, and
+  `REVOKE ... ON ALL TABLES` reaches none of the others -- an identity column
+  is a sequence object of its own, so a privilege on one outlives every repair
+  that names only tables.
+- Role provisioning is responsible for the privileges that live outside the
+  schema as well as the grants inside it. Repairing a role sets `NOSUPERUSER
+  NOCREATEDB NOCREATEROLE NOBYPASSRLS NOREPLICATION NOINHERIT` and revokes the
+  role memberships it did not grant, before applying capability grants. There is
+  no opt-out: a caller that cannot complete the repair gets an error rather than
+  a partly narrowed role, because the next thing done with that role is handing
+  out its credentials.
+- Row-level security covers the six tables that hold queue-scoped *work*, not
+  only `jobs` and `job_attempts`: concurrency slots, runtime heartbeats,
+  schedules, and schedule occurrences are queue-scoped by the same
+  `role_queue_grants` policy. Two queue-carrying tables are outside it by
+  design and readable in full: `queue_pauses`, because a policy scoped to a
+  role's own queues would hide the `'*'` global pause from the workers that
+  must honour it, and `role_queue_grants` itself, because every policy above is
+  a subquery against it evaluated as the querying role, so under RLS it would
+  filter itself and every policy would match nothing. Both leak the shape of
+  the deployment -- which queues exist, which are paused, which roles hold
+  what -- and neither is writable by a scoped role. `role_runtime_kinds`, which
+  records the kinds a role may claim liveness as, is outside it for the same
+  reason as the second of those and carries no queue; it is not directly
+  readable either, since the policies reach it through a `SECURITY DEFINER`
+  function. Where such a table's own
+  key was global it is narrowed to include the
+  queue, so that the key an upsert resolves against and the policy that decides
+  visibility agree on what identifies a row; a concurrency key is therefore
+  scoped to its queue, as `dedupe_key` already was, and a heartbeat is one
+  component's liveness on one queue. Where such a row also references a job or
+  a schedule, its queue must be tied to that reference by constraint, not
+  merely written by the caller: a policy can only test the label, so a label
+  the writer chooses is not a boundary. This matters wherever such a row also
+  carries a globally unique key -- an attempt number, a slot key, an occurrence
+  instant -- because forging the label consumes that key and denies service to
+  the queue that owns it.
+- Liveness is recorded per queue, so a component that serves several records
+  one heartbeat per queue served, and an unfiltered liveness query counts each
+  instance once. A component serving no queue records nothing rather than
+  claiming a queue it does not feed.
+- Where a queue label is tied to a reference, the reference must be one whose
+  queue cannot change. A job qualifies; a schedule does not.
+- A uniqueness guarantee that spans queues must not be scoped by queue. The
+  occurrence key is one: scoping it would let a schedule moved between queues
+  fire its history again. Such a key is protected by a policy that asks what
+  the writer can see, not by narrowing the key.
+
+### Shared durable state: states, owners, and ordering
+
+The tables above are written by several processes at once, and the bullets in
+this section and in §6 and §7 constrain them one property at a time. This is
+the same content stated once as a whole, because a concurrency invariant that
+is only ever described in pieces is one nobody can check.
+
+For each, the complete state set, who may cause each transition, and what is
+ordered with respect to what. "Operator" means an `Admin` call or the CLI;
+"migration role" means the identity that runs DDL.
+
+**`concurrency_slots`** — a row *is* the lease on a named key.
+
+| State | Meaning |
+| --- | --- |
+| absent | the key is free |
+| held | a row whose `leased_until` is in the future |
+| expired | a row whose `leased_until` has passed; free, but not yet reaped |
+
+- Worker, claiming: absent or expired → held, as one `INSERT ... ON CONFLICT
+  (queue, key) DO UPDATE ... WHERE leased_until <= now()`. Two workers racing
+  for one key serialize on the row; the loser claims no job.
+- Worker, finalizing: held → absent, `DELETE` matched on `job_id` *and*
+  `lease_token`. A worker whose lease expired cannot release the slot its
+  successor now holds.
+- Time: held → expired. No actor, no statement, no reaper.
+- A slot records the role holding it, and only that role may extend or release
+  it while the lease is live. Queue scope cannot express this: every worker on
+  a queue shares the slot table, so a policy that stops at the queue lets any
+  of them delete a slot another is holding, after which the key is held twice.
+- The expiry branch is the exception, and it is the table's oldest rule: an
+  expired slot may be taken over or cleared by any role granted the queue,
+  because the holder it is cleaning up after is by definition not there to do
+  it. Taking one over takes over the ownership with it.
+- The slot is acquired inside the claim transaction and released inside the
+  finalize transaction, so a job is never leased without its slot and never
+  holds a slot after its attempt is durable.
+
+**`runtime_heartbeats`** — one row per `(kind, instance, queue, role)`.
+
+| State | Meaning |
+| --- | --- |
+| absent | that component is not serving that queue |
+| fresh | `updated_at` within the caller's staleness window |
+| stale | older than it; the component is presumed dead |
+
+- Worker or scheduler: absent or stale → fresh, upserting its own row once per
+  tick, for each queue it serves and no other.
+- Scheduler: fresh → absent, for a queue that has dropped out of its enabled
+  set, on the same tick. Retraction is scoped by ownership alone: a role may
+  always take down what it wrote, whatever it is currently entitled to serve.
+  Every other condition on it is a way for a claim to outlive the thing it
+  claims, and under row-level security it fails silently, because an excluded
+  row is invisible rather than forbidden. A worker's queues are fixed at construction, so it has
+  nothing to retract.
+- A policy must not depend on a grant that only provisioning can make. A policy
+  expression is evaluated as the querying role, so a table a policy reads is a
+  table every role it governs must hold `SELECT` on -- and a migration cannot
+  grant that to roles that already exist. A table introduced alongside the
+  policy that reads it is therefore reached through a `SECURITY DEFINER`
+  function, not directly.
+- A change to a key that a running process's statements name is a change that
+  process cannot survive, and no grant or policy can soften it: an `ON CONFLICT`
+  target resolves against an index, and one that no longer exists is an error
+  on the next statement, inside a binary none of the new code runs in. Such a
+  migration must either not be reachable while the previous release is running,
+  or say plainly that it is not. Keeping the old key alongside the new one is
+  not a third option when the two disagree about what a row is.
+- A privilege a running role may lack is asked for only when it is needed. A
+  schema migration cannot re-grant anything to an existing role, so a grant
+  added by one is absent until an operator re-provisions; a statement issued
+  unconditionally would fail every tick of every deployment, including the ones
+  with nothing to do. When it is needed and refused, the claim is left to go
+  stale rather than the tick to fail.
+- Time: fresh → stale. This is the answer for a process that *died* — it cannot
+  retract anything, so time must. It is not the answer for a running process
+  whose responsibilities changed; that one says so itself.
+- No component writes another's row, and no operator writes any of them. This
+  is enforced, not merely intended: the row records the role that wrote it and
+  a role may only write, refresh or retract its own. Queue scope alone cannot
+  say it -- on a queue a worker and a scheduler share, it lets either write the
+  other's row.
+- A role may only claim a `kind` its capabilities entitle it to, recorded at
+  provisioning time. Ownership alone leaves the other half open: a worker role
+  inserting a row that says `scheduler` owns that row legitimately, and tells a
+  readiness probe the same lie as overwriting a real one.
+- Ordering within a tick: the upserts commit with the retraction, so a probe
+  never sees a served queue without its heartbeat.
+
+**`schedules`** — declared in code, synced to the database.
+
+| State | Meaning |
+| --- | --- |
+| enabled | `tick()` considers it |
+| disabled | it is ignored, and its history is kept |
+
+- Scheduler `sync()`, or operator: either direction. A schedule's queue may
+  also change, which is why nothing else may be tied to it (see the bullet on
+  references whose queue cannot change).
+- Disabling is not deleting: occurrences already fired stay, and re-enabling
+  does not re-fire them.
+
+**`schedule_occurrences`** — one row per `(schedule_id, occurrence_at)`, and
+the exactly-once guarantee for scheduling.
+
+| State | Meaning |
+| --- | --- |
+| absent | that occurrence has not fired |
+| fired | it has, in the same transaction as the job it created |
+
+- Scheduler: absent → fired, insert-only. There is no update and no delete; the
+  `SCHEDULE` capability grants neither.
+- A plain `INSERT`, not `ON CONFLICT DO NOTHING`, so a second scheduler waits
+  on the first's uncommitted row and proceeds only if that transaction aborted.
+- Removed only by cascade, with the job or the schedule.
+- The key is not queue-scoped: a schedule moved between queues must not fire
+  its history again.
+
+**`queue_pauses`** — admission control, not lifecycle.
+
+| State | Meaning |
+| --- | --- |
+| absent | the queue admits work |
+| paused | a row with `paused_at` set; claims yield nothing |
+
+- Operator only, either direction. Pausing twice keeps the first `paused_at`.
+- `'*'` is a row like any other and means every queue. Resuming `'*'` clears
+  the named pauses too; resuming one queue does not lift the wildcard.
+- The gate is in the claim SQL, so it binds every worker whatever a `Worker`
+  believes. It never touches a job already leased.
+
+**`role_queue_grants`** — the data the policies read.
+
+- Migration role only. A scoped role holds `SELECT` and nothing else, which is
+  what stops it granting itself a queue.
+
+**`role_runtime_kinds`** — which component kinds a role may claim liveness as.
+
+| State | Meaning |
+| --- | --- |
+| no rows | the role may write no heartbeat at all |
+| `worker` | it holds `CONSUME`, and may claim liveness as a worker |
+| `scheduler` | it holds `SCHEDULE`, and may claim liveness as a scheduler |
+| both | it holds both capabilities, and may claim either |
+
+- `provision_role` only. Not an operator, not a runtime component, and not the
+  component whose kind it describes -- a role that could write this table could
+  authorize its own liveness claims, which is the whole thing the table is for.
+- Replaced on every provisioning call, not merged into: the rows are deleted
+  and re-inserted from the capability set in that call. So narrowing a role
+  takes its kinds with it -- re-provisioning a `CONSUME`-and-`SCHEDULE` role
+  with `CONSUME` alone leaves it `worker`, and with neither (`INSPECT`,
+  `PRODUCE`, `PURGE`) leaves it no rows and no ability to heartbeat.
+- `revoke_role` deletes them, like the queue grants.
+- The migration that introduced the table backfilled a row for every role that
+  already held the corresponding capability, derived from the grants it held at
+  that moment. That is a one-time reconstruction of what provisioning would
+  have written, and it is not re-derived afterwards: a backfilled row stays
+  exactly as the migration left it until that role is next provisioned, at
+  which point the replace above takes over and the grants stop being consulted.
+  A capability changed by hand in between is therefore not reflected here,
+  which is a reason to narrow a role by re-provisioning it rather than by
+  revoking privileges directly.
+
+**Retention** — the only path by which a durable job row disappears.
+
+- Operator only, through `purge_terminal_jobs`, and only for jobs in a terminal
+  state older than the cutoff. A live job is never a candidate.
+- Deleting a job cascades to its attempts, its slots, and its occurrences, so
+  retention has one knob rather than four.
+- Ordering: oldest-first across the whole schema, bounded by the budget. See
+  the retention bullets above for what that costs and why.
+
+**Revised:** the original §8 bullet described the role model only in terms of
+who may enqueue, claim, and run DDL. Auditing the first consuming application
+showed that leaves three real gaps -- a worker role that could enqueue, a
+purger that could only be expressed as a raw `DELETE` grant, and a "repaired"
+role that kept `SUPERUSER` or `BYPASSRLS` through provisioning -- so the
+bullets above are added rather than reworded. Breaking the capability grants
+was accepted: a least-privilege model that has to be widened by hand at every
+call site is not one.
 
 ## 9. Explicit non-goals for v1
 

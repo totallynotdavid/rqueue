@@ -44,10 +44,203 @@ applied 0001_core
 applied 0002_scheduling
 applied 0003_queue_pause
 applied 0004_retry_policy
+applied 0005_queue_scoped_runtime
+applied 0006_purge_function
+applied 0007_retention_by_queue
+applied 0008_heartbeat_ownership
+applied 0009_retract_own_heartbeat
+applied 0010_slot_ownership
+applied 0011_scheduler_enqueue_grant
 ```
 
 Queue tables live in their own schema, `task_queue` by default, never in your
 application's business schema. Pass `--schema` to change it.
+
+**Three migrations need the fleet stopped first.** 0005, 0008 and 0010 each
+invert the usual ordering to "stop, clear, migrate, deploy" rather than
+"migrate, deploy", and each checks that for itself rather than trusting the one
+before it. 0005 is the worked example; the notes on 0008 and 0010 below say
+what they add. It changes the heartbeat key, and the previous release writes
+`ON CONFLICT (kind, instance)`, which stops matching any index the moment it
+runs. That statement opens every
+worker tick and its failure is retried, not fatal, so an old worker does not
+crash -- it stalls, claiming nothing. The migration refuses to be the cause of
+that:
+
+```console
+$ rqueue migrate
+error: migration 0005_queue_scoped_runtime failed: rqueue: 1 runtime heartbeat row(s) present
+HINT:  Stop every rqueue worker and scheduler and confirm the processes have
+exited. Then DELETE FROM task_queue.runtime_heartbeats, wait one poll interval,
+and check it is still empty -- a process that had not yet ticked refills it,
+which is the only way to see one. Re-run the migration, then deploy.
+```
+
+(The schema in that hint is whichever one you are migrating, not necessarily
+`task_queue`.)
+
+The check is deliberately not "has anything beaten recently?" -- a worker with
+a long poll interval is alive with an old heartbeat, and any window generous
+enough for it means nothing. An *empty* table is checkable instead: rqueue
+never deletes these rows, and a running process rewrites its own within one
+poll interval. The migration takes `ACCESS EXCLUSIVE` on that table before
+looking, so nothing can slip in between the check and the key change, and
+nothing is applied when it refuses -- the running fleet keeps working while you
+stop it.
+
+Be exact about what an empty table proves: not "nothing is running", but
+"nothing has ticked since it was cleared". A process that has started and not
+yet reached its first tick has written nothing to see. So clear the table,
+**wait a poll interval, and confirm it is still empty** -- that is what turns
+such a process into a visible one, because ticking is the only thing it can do
+next. A process started after that check fails from its first tick, having
+never claimed a job, rather than degrading a fleet that was working. That
+window is the drain, and it belongs to the deployment.
+
+**Re-run `provision_role` for every role after upgrading rqueue.** The grant
+table lives in `rqueue.roles`, which makes it part of the *release*, not part
+of the schema: `migrate` moves the schema forward and leaves every existing
+role holding whatever the version that provisioned it handed out. A role is
+correct on the day it is provisioned and drifts from then on, so an upgrade is
+two steps, not one:
+
+```python
+await provision_role(
+    connection, role="cron_runner", capabilities=[Capability.SCHEDULE],
+    queues=["compute"],
+)
+```
+
+It is idempotent and it is the repair: the revokes run first, so the role ends
+up holding exactly the capabilities named here and nothing else.
+
+A migration can do some of this for you, and this release does what it safely
+can -- 0011 below. What it cannot do is decide anything that depends on the
+capability set, because the database has never recorded it. Grants can be
+fingerprinted where a capability implies a privilege nothing else grants, and
+that is enough to *add*; it is not enough to take away, since a privilege two
+capabilities both confer looks identical either way.
+
+What this release changes, and what you get by re-provisioning:
+
+| Capability | Change | Until you re-provision |
+| --- | --- | --- |
+| `SCHEDULE` | `UPDATE (updated_at)` on `jobs` | Repaired by 0011; nothing to do |
+| `SCHEDULE` | `DELETE` on `runtime_heartbeats` | Ticks and schedules normally, but cannot retract a heartbeat for a queue whose last schedule was disabled, so readiness reports it as still feeding that queue until the staleness window expires. Logged once, naming the queue and this remedy |
+| `INSPECT` | `SELECT` on `concurrency_slots` and `runtime_heartbeats` | `check_readiness` raises rather than reporting, so a probe using an inspection role reports the database unreachable. This is a fix, not a regression -- the grant was missing before too |
+| `CONSUME` | loses `INSERT` on `jobs` | The worker role stays able to enqueue, which is the separation this release adds. Only re-provisioning closes it |
+| `PURGE` | new capability | Nothing; no existing role has it |
+
+Nothing about 0008 *itself* needs a re-provision. The kinds a role may claim are
+backfilled from the grants it already holds, and the policies read them through
+a `SECURITY DEFINER` function rather than the table, so a role provisioned by
+the previous release keeps writing its heartbeat with no new grant of any kind
+-- which matters because a heartbeat is the liveness mechanism itself and has
+nothing to fall back to. A row written before the migration is attributed to
+whoever ran it and simply ages out.
+
+**0008 changes the heartbeat key, so deploy after the whole migration, not
+between.** The key gains the writing role, and the previous release's upsert
+names `ON CONFLICT (kind, instance, queue)`, which stops matching any index the
+moment 0008 lands:
+
+```
+ERROR:  there is no unique or exclusion constraint matching the ON CONFLICT
+specification
+```
+
+That is the same failure 0005 describes, for the same reason, and 0008 refuses
+in the same way: `ACCESS EXCLUSIVE` on the table, then the same demand that it
+be empty. It does not lean on 0005 having asked. A migration body runs exactly
+once, so a database that applied 0005 in an earlier release -- possibly months
+ago -- never re-runs that check when it picks this one up; an upgrade in place
+would otherwise walk straight into the new key with the fleet still running.
+After the drain, applying every pending migration in one `rqueue migrate` is
+safe, and it is the default.
+
+Stopping in between -- `--target 7`, deploy, `--target 8` -- is the sequence
+that puts a running previous-release worker in front of the new key, and it is
+what the check catches: the redeployed fleet beats, and `--target 8` refuses
+rather than stalling it. It has to be caught there, because nothing downstream
+can help. The heartbeat upsert is the first statement of every tick, the error
+is retried rather than fatal, and nothing in the new code runs inside that old
+process to turn it into a better message.
+
+Keeping a three-column unique index alongside the new key would make the old
+statement resolve, and is not an option: it would forbid two roles from holding
+separate rows for one component, which is the deadlock 0008's key change exists
+to avoid. Grant compatibility and binary compatibility are separate questions,
+and 0008 buys the first deliberately -- a role provisioned by the previous
+release keeps working -- while the second is what this note is about.
+
+**0010 needs the leases drained too, not just the fleet stopped.** It records
+which role holds each concurrency slot, and there is nothing in a row written
+before it that says who that was -- so every existing row is attributed to
+whoever runs the migration. For a heartbeat that is harmless: 0008 leaves an
+orphan that ages out while its component writes a fresh row on the next tick. A
+slot is not a signal, it is the mutual exclusion for an attempt that is running
+right now, and its real holder can neither extend nor release a row it no
+longer owns. The lease would run out under the running attempt, and at that
+moment the key becomes acquirable by any worker on the queue -- a second worker
+starting the same logical job while the first is still inside it.
+
+So 0010 refuses on either of two counts:
+
+```console
+$ rqueue migrate
+error: migration 0010_slot_ownership failed: rqueue: 1 concurrency slot(s) still leased
+HINT:  Stop every rqueue worker, confirm the processes have exited, and let the
+outstanding leases expire -- bounded by the lease_seconds the workers ran with.
+A slot outliving its worker is already stale, so DELETE FROM
+task_queue.concurrency_slots is equally good once nothing is running. Re-run
+the migration, then deploy.
+```
+
+and, separately, on a non-empty `runtime_heartbeats` -- because slots cannot
+show you that the fleet is stopped. A worker between jobs holds no slot and is
+invisible in that table, and it needs to be visible: the previous release's
+takeover path never sets the owner column 0010 adds, so the first time it takes
+over a slot another role left expired it fails with `new row violates row-level
+security policy`. Inside a single `rqueue migrate` that second check costs
+nothing, 0008 having just demanded the same thing; it is there for the staged
+upgrade -- `--target 9`, deploy, `--target 10` -- which is the only way to
+arrive at 0010 with a fleet running.
+
+**0011 repairs the one grant a scheduler cannot do without.** Every enqueue is
+an `INSERT ... ON CONFLICT ... DO UPDATE SET updated_at`, and PostgreSQL wants
+`UPDATE` on every column a `DO UPDATE SET` names -- even one written back to
+its own value. This release adds that column-scoped grant to `SCHEDULE`, and a
+scheduler role from the previous release does not have it. There is no degraded
+mode: it cannot enqueue at all, and `Scheduler.run` catches the error alongside
+every other PostgreSQL failure, so what you see is `could not reach PostgreSQL;
+retrying` once a tick while nothing fires.
+
+So 0011 grants it, to every role in `role_queue_grants` that holds `INSERT` on
+`schedules` -- the fingerprint 0008 already uses, and an exact one, since no
+other capability grants that. Adding on a fingerprint is safe here because a
+role it matches already holds `INSERT` on `jobs`: the repair widens nothing an
+operator had not already agreed to. Taking away on a fingerprint would not be,
+which is why the `CONSUME` row in the table above still needs you.
+
+**0006 changes who may purge.** Retention used to be a plain `DELETE`, so any
+role with that privilege could run it. It now goes through a `SECURITY
+DEFINER` routine that authorizes the *login* role against `role_queue_grants`,
+which is what lets a `PURGE` role delete without holding `DELETE` on `jobs`.
+The trade is that privilege alone is no longer enough:
+
+```console
+ConfigurationError: role dba_ops is not granted queue alpha
+```
+
+Three identities are let through without a row: the schema owner, a superuser,
+and any role `provision_role()` created -- it writes the row in the same call.
+What is left is an operator identity that predates this and is neither: a
+service account for a retention cron, say. Give it a row, or run the cron as
+one of the three:
+
+```python
+await grant_queues(connection, role="retention_cron", queues=["*"])
+```
 
 ### 2. Register tasks
 
@@ -80,10 +273,17 @@ async def prepare_simulation(payload: PreparePayload, context: TaskContext) -> N
 ```
 
 When a handler catches an exception to update application-owned state before
-re-raising it, `context.will_retry(exc)` reports whether the worker's registered
-retry policy will schedule another attempt. It accounts for the last attempt
-and `PermanentFailure`, and reports `True` for `Retry` or `False` for
-`CancelJob`, without calculating a backoff timestamp:
+re-raising it, `context.will_retry(exc)` reports whether the worker will
+schedule another attempt -- the same decision the worker itself makes, so the
+state you record cannot disagree with what happens next. It accounts for
+`PermanentFailure`, reports `False` for `CancelJob`, and honours this job's own
+persisted `max_attempts`, not the registered policy's default.
+
+That last point covers `Retry` too. Raising it skips the policy's exception
+filter, not the attempt budget: on the last attempt `will_retry` reports
+`False` and the worker fails the job terminally, because rescheduling it would
+return it to `pending` with no attempts left, where no worker would ever claim
+it again.
 
 ```python
 try:
@@ -286,7 +486,10 @@ absorbs an enqueue.
 resource -- "one simulation at a time per compute job". It is a lease, not a
 flag: the holder's slot is released when the job finishes, and expires on its
 own if the holder dies, so a crashed worker cannot hold a business resource
-hostage.
+hostage. Like `dedupe_key`, it is scoped to one queue: two queues using the
+same key name do not exclude each other, because a queue is the boundary a
+least-privilege role is scoped to and a lock that crossed it would be a lock a
+scoped worker could neither see nor take.
 
 ## Ordering and fairness
 
@@ -448,11 +651,132 @@ await provision_role(
 )
 ```
 
-The migration role owns the schema and is the only role that runs DDL. A
-producer may enqueue and read; a worker may claim and transition; neither can
-change the schema. Queue scoping is enforced by row-level-security policies
-driven by rows in `role_queue_grants`, so the queues a role may touch arrive as
-bind parameters rather than interpolated SQL.
+The migration role owns the schema and is the only role that runs DDL. Queue
+scoping is enforced by row-level-security policies driven by rows in
+`role_queue_grants`, so the queues a role may touch arrive as bind parameters
+rather than interpolated SQL. Six tables are under those policies: `jobs`,
+`job_attempts`, `concurrency_slots`, `runtime_heartbeats`, `schedules`, and
+`schedule_occurrences`.
+
+A heartbeat is the one row whose queue scope is not the whole answer at all. On a
+queue a worker and a scheduler share, "may this role touch this queue?" lets
+either of them write the other's liveness row, so the row also records the role
+that wrote it and only that role may refresh or retract it -- and the `kind` it
+claims must be one that role's capabilities entitle it to, or a worker could
+tell a readiness probe a scheduler is alive by inserting a row of its own.
+Reading stays wide -- readiness has to see components it did not write -- and
+retracting is narrower still: a role may delete a heartbeat it wrote whatever
+it is currently granted, because taking a claim down asserts nothing. Requiring
+the queue grant there would strand a scheduler's own row on a queue an operator
+had just reassigned, unreadable and undeletable by anyone but the schema owner.
+
+That is not every table carrying a queue name. Two are deliberately left out,
+for different reasons and with different consequences -- one is readable by any
+role that can reach the schema, the other is not directly readable at all:
+
+- `queue_pauses`, because the wildcard pause is a row on the queue `'*'` and a
+  policy scoped to a role's own queues would hide it. A worker that cannot see
+  the global pause does not honour it, which is the one outcome the pause table
+  exists to prevent. The cost is that a role granted one queue can see every
+  queue's pause state -- when it was paused, and by implication that it exists.
+- `role_runtime_kinds`, which records which component kinds a role may claim
+  liveness as. Not directly readable at all, in fact: the heartbeat policies
+  reach it through a `SECURITY DEFINER` function, so no runtime role needs a
+  grant on it. It carries no queue column, so the count above is unaffected.
+- `role_queue_grants`, because the policies on the six tables above are
+  themselves subqueries against it, evaluated as the querying role. Under RLS
+  it would filter itself and every other policy would match nothing. It is
+  granted `SELECT` directly instead, so a scoped role can read every role's
+  queue grants -- the shape of the deployment, not a way into it. Only the
+  migration role may write it, which is what keeps a role from granting itself
+  a queue.
+
+A policy can only test the queue the writer wrote, and on a row that also
+points at a job that is a label rather than a boundary. Those labels are tied
+to their job by composite foreign key -- attempt records, concurrency slots,
+and occurrences alike -- so a role granted one queue cannot attach its own
+label to another queue's job and pass its own policy. That matters because the
+keys those rows carry are global: an attempt number, a slot key, an occurrence
+instant. Forging one consumes it, and the queue that really owns it is denied
+service.
+
+The anchor is always the job, because a job's queue never changes. A schedule's
+can, so an occurrence takes its queue from the job it fired, not from the
+schedule that fired it -- moving a schedule leaves its existing history where
+those jobs actually live. The occurrence key itself stays queue-free: it is the
+one-firing-per-instant guarantee and has to mean the same thing from every
+queue. What protects it is the policy, which asks whether the writer can see
+the schedule at all -- so a scheduler reads the whole history of a schedule it
+owns, across a queue move, but can only write occurrences for schedules on
+queues it holds.
+
+A scheduler reports liveness for the queues it schedules. With no enabled
+schedules it reports none, because nothing is being scheduled -- there is no
+queue for it to be the live scheduler of.
+
+| Capability | May |
+| --- | --- |
+| `PRODUCE` | enqueue and read jobs (`UPDATE` only on `updated_at`, for the enqueue conflict path) |
+| `CONSUME` | claim, heartbeat, and transition jobs -- but **not** enqueue them |
+| `SCHEDULE` | read schedules and enqueue their occurrences -- but not transition a job |
+| `INSPECT` | read everything, write nothing, including the liveness a readiness probe needs |
+| `PURGE` | delete terminal jobs, through `purge_terminal_jobs()` and only through it |
+
+`CONSUME` has no `INSERT` on `jobs`: claiming work and creating it are separate
+authorities, and a worker that can enqueue can hand the fleet any task it
+likes. A process that legitimately does both -- a worker that fans out
+follow-up jobs -- asks for `[Capability.PRODUCE, Capability.CONSUME]` and says
+so in its provisioning call.
+
+`PURGE` has no `DELETE` on `jobs` either. It gets `EXECUTE` on
+`task_queue.purge_terminal_jobs(queue, states, finished_before, max_rows)`, a
+`SECURITY DEFINER` routine installed by migration 0006 that re-derives every
+limit for itself: one named queue the caller is granted, terminal states only,
+a cutoff in the past, and a bounded batch. The routine is the safety boundary,
+not the grant -- a crafted call cannot reach a `pending` job, another queue's
+jobs, or the whole table.
+
+`Admin.purge()` and `rqueue purge` go through that routine, so they are exactly
+what `PURGE` authorizes -- there is no second, rawer path:
+
+```python
+removed = await Admin(pool).purge(queue="compute", retention=timedelta(days=30))
+```
+
+Naming a queue is the cheaper call. "Every queue" is spelled by omitting the
+argument, not by the `"*"` that pause and resume take -- purge reads `"*"` as a
+queue name, and there is no queue by that name. Omitting it purges every queue
+that has anything to purge -- for a scoped role, every queue it can see --
+spending `limit` across them as one budget, oldest job first regardless of
+which queue it is on, and deleting that many when that many exist. None of that
+follows from visiting the queues in a good order: the cutoff is first tightened
+to the age of the budget's last row -- inclusive of every job finishing in the
+same instant, since a transaction that finishes a hundred jobs gives them all
+one `finished_at` -- so no queue can reach past it however much backlog it has.
+Tightening it is also what keeps the work proportional to `limit` rather than
+to the backlog behind it. Only terminal states may be named; asking for a live
+one raises rather than quietly matching nothing. The cutoff must be
+timezone-aware, as every caller-supplied instant in rqueue is.
+
+A role that *owns* a table in the schema, the schema itself, or the database is
+refused outright, with nothing written. Ownership sits above the ACL that
+`provision_role()` edits: an owner can re-grant itself anything, and `ALTER` or
+`DROP` the table -- including switching row-level security off. Reassign the
+object to the migration role first.
+
+Provisioning also repairs what lies outside the schema. A provisioned role is
+set `NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS NOREPLICATION NOINHERIT`
+and stripped of every role membership before its capability grants are applied,
+so re-running `provision_role()` on a role someone quietly made a superuser
+really does narrow it. There is no switch to ask for less: a connection that
+cannot clear an attribute the role holds raises, rather than returning a role
+that is only partly narrowed.
+
+The whole call is one transaction, so that holds for every other failure too.
+Granting `PURGE` against a schema whose migrations stop short of the purge
+routine is the one you meet mid-deploy; it raises, and the role is left exactly
+as the call found it -- absent if it did not exist, untouched if it did --
+rather than existing, able to log in, and carrying half a capability set.
 
 ## Storage
 
@@ -460,13 +784,16 @@ bind parameters rather than interpolated SQL.
 | --- | --- |
 | `jobs` | one row per job, including its lease and terminal outcome |
 | `job_attempts` | one immutable record per attempt, for audit and debugging |
-| `concurrency_slots` | the lease behind each named concurrency key |
+| `concurrency_slots` | the lease behind each named concurrency key, per queue |
 | `schedules` | periodic schedule definitions |
 | `schedule_occurrences` | the occurrence keys that have fired, and their jobs |
-| `runtime_heartbeats` | worker and scheduler liveness, for readiness checks |
+| `runtime_heartbeats` | worker and scheduler liveness per queue, for readiness checks |
 | `queue_pauses` | which queues are paused, and since when |
 | `role_queue_grants` | which queues a granted role may reach |
 | `schema_migrations` | applied migration versions and their checksums |
+
+Plus one routine: `purge_terminal_jobs()`, the `SECURITY DEFINER` boundary the
+`PURGE` capability is granted instead of a table-wide `DELETE`.
 
 Every index is declared in the migration next to the query it serves. All
 internal SQL is static and parameterized. The runtime read/write path lives in

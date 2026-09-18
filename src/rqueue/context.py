@@ -103,7 +103,12 @@ class TaskContext:
             return cached[1]
 
         if isinstance(exc, Retry):
-            decision = True
+            # A handler asking for another attempt cannot conjure budget the
+            # job does not have. `Retry` skips the policy's exception filter,
+            # not its attempt limit: a job enqueued with max_attempts=1 that is
+            # rescheduled anyway comes back pending with attempt == the limit,
+            # which the claim predicate excludes -- pending forever, run never.
+            decision = not self.is_last_attempt
         elif isinstance(exc, CancelJob):
             decision = False
         else:

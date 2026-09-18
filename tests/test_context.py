@@ -35,15 +35,27 @@ def test_will_retry_matches_worker_retry_decision(
 
 
 @pytest.mark.parametrize(
-    ("exc", "expected"),
-    [(Retry(), True), (CancelJob(), False)],
+    ("attempt", "exc", "expected"),
+    [
+        (1, Retry(), True),
+        (2, Retry(), False),
+        (1, CancelJob(), False),
+        (2, CancelJob(), False),
+    ],
 )
 def test_will_retry_matches_control_flow_signals(
-    exc: BaseException, expected: bool
+    attempt: int, exc: BaseException, expected: bool
 ) -> None:
+    """`Retry` skips the policy's exception filter, not the attempt budget.
+
+    A handler asking for another attempt cannot conjure one the job does not
+    have: rescheduling past the budget returns the job to pending with
+    ``attempt == max_attempts``, which the claim predicate excludes -- pending
+    forever, and never run again.
+    """
     context = _make_context(
-        attempt=1,
-        max_attempts=1,
+        attempt=attempt,
+        max_attempts=2,
         retry=RetryPolicy(max_attempts=5),
     )
 
