@@ -61,6 +61,10 @@ def test_no_statement_uses_string_formatting_for_values() -> None:
         # The queue wildcard is a fixed sentinel, like the state names above,
         # and the same one migration 0002's RLS policies already spell out.
         "'*'",
+        # The resolution of a timestamptz column, not a value from a caller:
+        # the smallest step that makes the routine's strict `<` include every
+        # row sharing the boundary instant.
+        "'1 microsecond'",
     }
     literal = re.compile(r"'[^']*'")
     for name, sql in statements().items():
@@ -126,3 +130,95 @@ def test_operator_retry_updates_the_persisted_attempt_ceiling() -> None:
     sql = statements()["retry_terminal"]
     assert "jsonb_set" in sql
     assert "ARRAY['max_attempts']" in sql
+
+
+def test_a_global_liveness_probe_counts_each_instance_once() -> None:
+    """Heartbeats are keyed per queue, so one process holds several rows.
+
+    Without DISTINCT, `check_readiness(queue=None)` reports one scheduler
+    serving three queues as three schedulers -- a readiness answer that counts
+    deployments which do not exist.
+    """
+    assert "SELECT DISTINCT instance" in statements()["live_instances"]
+
+
+def test_a_heartbeat_is_keyed_by_the_queue_and_the_role_that_wrote_it() -> None:
+    """The arbiter has to match the unique index, role_name included.
+
+    The statement never supplies `role_name` -- it defaults to `current_user`,
+    which is the whole point of the column -- but the arbiter still names it,
+    because PostgreSQL resolves `ON CONFLICT` against an index, not against the
+    columns the INSERT happens to list. Naming three of four raises 42P10.
+    """
+    upsert = statements()["record_runtime_heartbeat"]
+    assert "ON CONFLICT (kind, instance, queue, role_name) DO UPDATE" in upsert
+    assert "role_name" not in upsert.split("ON CONFLICT")[0]
+
+
+def test_retracting_a_heartbeat_reaches_only_the_writers_own_rows() -> None:
+    """The policy says so too; the statement says it where the owner can hear.
+
+    The schema owner bypasses row-level security, so a predicate left to the
+    policy alone has a different reach for the owner than for a scoped role.
+    Spelling it in both keeps `clear_runtime_heartbeats` and the check that
+    precedes it deleting exactly the same rows for everyone.
+    """
+    for name in ("clear_runtime_heartbeats", "stale_heartbeat_queues"):
+        sql = " ".join(statements()[name].split())
+        assert "kind = $1 AND instance = $2 AND role_name = current_user" in sql, name
+        assert "queue <> ALL($3::text[])" in sql, name
+
+
+def test_retention_deletes_through_the_routine_not_a_delete() -> None:
+    """PURGE grants EXECUTE and no DELETE, so `Admin.purge` cannot use one.
+
+    The routine re-derives queue, terminal state, cutoff, and batch size for
+    itself; a DELETE here would carry those predicates instead, which is the
+    arrangement the capability exists to end.
+    """
+    purge = statements()["purge"]
+    assert "purge_terminal_jobs" in purge
+    assert "DELETE" not in purge.upper()
+
+
+def test_a_bounded_purge_visits_queues_oldest_first() -> None:
+    """A partial budget must be spent on the oldest rows in the schema.
+
+    One DELETE ordered by finished_at did that for free. Fanning out per queue
+    only keeps it if the queues are visited by the age of their oldest
+    candidate -- alphabetical order would delete a fresh job on 'aaa' and leave
+    a month-old one on 'zzz'.
+    """
+    purge_queues = statements()["purge_queues"]
+    assert "ORDER BY min(finished_at)" in purge_queues
+    assert "ORDER BY queue" not in purge_queues
+
+
+def test_the_queue_scan_carries_the_budget_as_well_as_the_horizon() -> None:
+    """The horizon alone bounds nothing, because a tie group has no size.
+
+    It is inclusive of the rows sharing the budget's last instant on purpose,
+    and one transaction can finish any number of jobs at that instant, so
+    `finished_at < horizon` can match the whole table. The scan that learns
+    which queues to visit therefore takes `limit` too -- the `limit` oldest
+    rows name every queue the budget can reach, and reading further only costs.
+    """
+    purge_queues = " ".join(statements()["purge_queues"].split())
+    assert "ORDER BY finished_at LIMIT $3" in purge_queues
+    # The grouping runs over that bounded scan, not over the table.
+    assert purge_queues.index("LIMIT $3") < purge_queues.index("GROUP BY queue")
+
+
+def test_the_purge_horizon_is_bounded_by_the_budget() -> None:
+    """Both ends of the candidate range come from LIMIT-ed index scans.
+
+    Without them the fan-out reads every terminal row behind the cutoff to
+    answer "which queues have anything?", which is the whole backlog on the
+    only deployments where retention cost matters.
+    """
+    horizon = " ".join(statements()["purge_horizon"].split())
+    assert "ORDER BY finished_at OFFSET $3 - 1 LIMIT 1" in horizon
+    # Inclusive of the boundary instant: the routine compares with a strict
+    # `<`, so every row tied with the boundary would otherwise be dropped even
+    # though it is inside the budget.
+    assert "finished_at + interval '1 microsecond'" in horizon

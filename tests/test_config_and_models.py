@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import pathlib
 import uuid
 from datetime import datetime, timedelta
 
@@ -239,3 +240,67 @@ def test_retry_backoff_saturates_rather_than_overflowing() -> None:
     assert policy.next_attempt_at(1) > datetime.now().astimezone() - timedelta(
         seconds=1
     )
+
+
+def test_limits_declares_everything_the_package_imports_from_it() -> None:
+    """`__all__` is a claim about the module, and it has to survive additions.
+
+    Every bound and validator here is reached by name from elsewhere in the
+    package, so an `__all__` that lists a subset is not a narrower public API --
+    it is a stale one that the package's own modules already reach around. This
+    checks both directions: nothing imported is missing from it, and nothing in
+    it fails to resolve.
+    """
+    import ast
+
+    from rqueue import limits
+
+    source = pathlib.Path(limits.__file__).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+
+    defined: list[str] = []
+    for node in tree.body:
+        if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            defined.append(node.target.id)
+        elif isinstance(node, ast.Assign):
+            defined += [t.id for t in node.targets if isinstance(t, ast.Name)]
+        elif isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+            defined.append(node.name)
+    public = {n for n in defined if not n.startswith("_") and n != "__all__"}
+    assert set(limits.__all__) == public, public.symmetric_difference(limits.__all__)
+    assert all(hasattr(limits, name) for name in limits.__all__)
+
+    # And what the rest of the package actually asks for by name.
+    wanted: set[str] = set()
+    for path in pathlib.Path(limits.__file__).parent.rglob("*.py"):
+        for found in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            if isinstance(found, ast.ImportFrom) and found.module == "rqueue.limits":
+                wanted |= {alias.name for alias in found.names}
+    assert wanted, "no module imports from rqueue.limits; this test is not testing"
+    assert wanted <= set(limits.__all__), sorted(wanted - set(limits.__all__))
+
+
+def test_purge_limit_is_bounded_before_a_statement_is_sent() -> None:
+    """The routine enforces this bound too; this makes it a typed error."""
+    from rqueue.limits import MAX_PURGE_LIMIT, validate_purge_limit
+
+    assert validate_purge_limit(1) == 1
+    assert validate_purge_limit(MAX_PURGE_LIMIT) == MAX_PURGE_LIMIT
+    for bad in (0, -1, MAX_PURGE_LIMIT + 1):
+        with pytest.raises(ValidationError):
+            validate_purge_limit(bad)
+
+
+def test_purge_states_are_checked_before_any_statement() -> None:
+    """The routine is the boundary, but a fan-out over zero queues never
+    reaches it -- so an invalid state must not come back as 0."""
+    from rqueue.storage import _validate_purge_states
+
+    assert _validate_purge_states(["succeeded", "cancelled"]) == [
+        "succeeded",
+        "cancelled",
+    ]
+    with pytest.raises(ValidationError, match="at least one terminal state"):
+        _validate_purge_states([])
+    with pytest.raises(ValidationError, match="pending is not terminal"):
+        _validate_purge_states(["succeeded", "pending"])

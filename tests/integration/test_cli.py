@@ -12,6 +12,7 @@ import uuid
 import asyncpg
 import pytest
 
+from rqueue import migrations
 from rqueue.cli import main
 
 
@@ -80,11 +81,15 @@ def test_status_reports_pending_migrations_with_a_nonzero_exit(
         assert main(["--database-url", admin_dsn, "--schema", schema, "status"]) == 1
         state = json.loads(capsys.readouterr().out)
         assert state["up_to_date"] is False
+        # Everything past the target, named and in order. Derived from the
+        # packaged set rather than transcribed, so shipping a migration does
+        # not silently need this test edited to stay meaningful.
         assert state["pending"] == [
-            "0002_scheduling",
-            "0003_queue_pause",
-            "0004_retry_policy",
+            f"{migration.version:04d}_{migration.name}"
+            for migration in migrations.load_migrations()
+            if migration.version > 1
         ]
+        assert len(state["pending"]) >= 2
     finally:
         _drop_schema(admin_dsn, schema)
 
