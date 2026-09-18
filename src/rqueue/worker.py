@@ -611,6 +611,19 @@ class Worker:
     ) -> None:
         will_retry = context.will_retry(exc)
         if isinstance(exc, Retry):
+            if not will_retry:
+                # The budget is the job's, persisted at enqueue -- not the
+                # registration's default -- and it is spent. Terminating here
+                # is what `_retry_now` already does when shutdown hands a lease
+                # back with nothing left to hand it to; the alternative is a
+                # pending row no claim predicate will match.
+                await self._safe_finalize(
+                    self._fail_terminal(job, token, "Retry", _describe(exc))
+                )
+                self.metrics.counter(
+                    "rqueue.job.failed", queue=self.queue.name, task=job.task
+                )
+                return
             await self._safe_finalize(
                 self._reschedule(
                     job,
