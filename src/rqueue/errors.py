@@ -2,7 +2,7 @@
 
 Two families live here. `RqueueError` and its subclasses report failures of the
 queue itself. `Retry`, `PermanentFailure`, and `CancelJob` are control-flow
-signals a task handler raises to choose its own outcome (REQUIREMENTS.md §5).
+signals a task handler raises to choose its own outcome (docs/requirements.md §5).
 """
 
 from __future__ import annotations

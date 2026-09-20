@@ -4,7 +4,7 @@
 
 The implementation is substantially complete and the concurrency mechanisms
 tested here behaved correctly. This review found one genuine gap: a role
-provisioned with `Capability.PRODUCE` alone could not enqueue at all -- a §8
+provisioned with `Capability.PRODUCE` alone could not enqueue at all. This was a §8
 least-privilege role bug that left the producer-only portion of acceptance
 criterion §10.10 unmet. No implementation files were changed by the review
 itself.
@@ -12,7 +12,7 @@ itself.
 **That gap is now fixed.** `Capability.PRODUCE` grants
 `SELECT, INSERT, UPDATE (updated_at)` on `jobs`: the column-scoped UPDATE the
 enqueue statement's `ON CONFLICT ... DO UPDATE SET updated_at` requires, and
-nothing wider -- a producer still cannot write `state`, `payload`, or
+nothing wider. A producer still cannot write `state`, `payload`, or
 `attempt`. §8 and §10.10 are met as of that change; the rest of this report
 stands as written.
 
@@ -30,7 +30,7 @@ stands as written.
 
 ## Requirements coverage
 
-- §1 Purpose: **met**. `README.md:1-5` documents the asyncpg-native,
+- §1 Purpose: **met**. `readme.md:1-5` documents the asyncpg-native,
   transactional-enqueue purpose and the implementation exposes that model.
 - §2 Platform/dependencies: **met**. `pyproject.toml:1-15` requires Python
   3.13+ and only runtime-depends on asyncpg; `src/rqueue/__init__.py:1-12`
@@ -80,7 +80,7 @@ stands as written.
   `asyncpg.exceptions.InsufficientPrivilegeError: permission denied for table
   jobs`.
   **Fixed** in `src/rqueue/roles.py`: `Capability.PRODUCE` now grants
-  `SELECT, INSERT, UPDATE (updated_at)` on `jobs` -- column-scoped, so the
+  `SELECT, INSERT, UPDATE (updated_at)` on `jobs`. The grant is column-scoped, so the
   conflict path works while `state`, `payload`, and `attempt` stay unwritable.
   The insert SQL and its conflict strategy were not changed. Because a
   produce+consume role also collects a whole-table `UPDATE` from `CONSUME`,

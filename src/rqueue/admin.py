@@ -1,4 +1,4 @@
-"""Inspection and administration operations (REQUIREMENTS.md §4, §7).
+"""Inspection and administration operations (docs/requirements.md §4, §7).
 
 These are deliberately outside :class:`~rqueue.context.TaskContext`: a handler
 cannot retry, cancel, or purge anything. They are for operators, admin

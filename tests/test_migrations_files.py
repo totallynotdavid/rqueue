@@ -150,7 +150,7 @@ def test_the_tables_left_out_of_rls_are_the_two_that_have_to_be() -> None:
     would then match nothing.
 
     Both are readable in full by any role that reaches the schema, which the
-    README states as the cost. This test exists so that claim stays checkable:
+    docs/roles.md states as the cost. This test exists so that claim stays checkable:
     a third exclusion appearing without a reason should fail here.
     """
     sql = "".join(m.sql for m in migrations.load_migrations())
@@ -278,14 +278,14 @@ def test_the_readme_migrate_transcript_matches_the_packaged_set() -> None:
     This one has gone stale twice, both times because a release added a
     migration and the block was transcribed rather than derived. A reader
     running `rqueue migrate` against a fresh database and seeing more lines
-    than the README shows has no way to tell whether that is drift or a
+    than docs/migrations.md shows has no way to tell whether that is drift or a
     problem, which is the whole value of printing it.
     """
-    readme = (pathlib.Path(__file__).resolve().parent.parent / "README.md").read_text(
-        encoding="utf-8"
-    )
+    readme = (
+        pathlib.Path(__file__).resolve().parent.parent / "docs" / "migrations.md"
+    ).read_text(encoding="utf-8")
     block = re.search(r"\$ rqueue [^\n]*migrate\n((?:applied \d{4}_\w+\n)+)", readme)
-    assert block is not None, "the README no longer shows a migrate transcript"
+    assert block is not None, "docs/migrations.md no longer shows a migrate transcript"
     shown = [
         line.removeprefix("applied ") for line in block.group(1).splitlines() if line
     ]

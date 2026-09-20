@@ -3,7 +3,7 @@ name = "rqueue"
 version = "0.2.0"
 description = "A durable PostgreSQL task queue for asyncpg applications"
 requires-python = ">=3.13"
-readme = "README.md"
+readme = "readme.md"
 license = { text = "MIT" }
 authors = [{ name = "David Duran", email = "dadch1404@gmail.com" }]
 dependencies = [
@@ -34,7 +34,7 @@ dev = [
 target-version = "py313"
 line-length = 88
 indent-width = 4
-# Markdown is excluded so the formatter never rewrites REQUIREMENTS.md, which
+# Markdown is excluded so the formatter never rewrites docs/requirements.md, which
 # is the spec this package is built against, not source to be reformatted.
 extend-exclude = ["__pycache__", "dist", "build", ".data", "*.md"]
 

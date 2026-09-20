@@ -18,7 +18,7 @@ fix = ["uv run ruff check --fix --unsafe-fixes .", "uv run ruff format ."]
 test = "uv run pytest -n auto -m 'not integration'"
 test-integration = "bash scripts/integration.sh"
 
-# The master pipeline test from REQUIREMENTS.md section 11, on its own, for the
+# The master pipeline test from docs/requirements.md section 11, on its own, for the
 # development outer loop.
 test-pipeline = "bash scripts/integration.sh tests/integration/test_master_pipeline.py"
 
