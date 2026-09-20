@@ -1,7 +1,7 @@
 """Create and remove disposable PostgreSQL databases for the test tasks.
 
 Mirrors picv-2025's ``scripts/database.py``, on asyncpg rather than psycopg so
-this repository keeps a single database driver (REQUIREMENTS.md §2).
+this repository keeps a single database driver (docs/requirements.md §2).
 """
 
 from __future__ import annotations

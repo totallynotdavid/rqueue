@@ -1,4 +1,4 @@
-"""The only module that reads or writes job and schedule rows (REQUIREMENTS.md §8).
+"""The only module that reads or writes job and schedule rows (docs/requirements.md §8).
 
 Every statement here is a module-level constant built once from a fixed tuple
 of column names and a schema identifier that has been through

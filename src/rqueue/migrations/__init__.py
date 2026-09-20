@@ -1,4 +1,4 @@
-"""Forward-only migration runner (REQUIREMENTS.md §7).
+"""Forward-only migration runner (docs/requirements.md §7).
 
 Nothing here runs implicitly. The only entry points are
 ``rqueue migrate`` (see :mod:`rqueue.cli`) and :func:`migrate`, which a test or

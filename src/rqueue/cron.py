@@ -1,4 +1,4 @@
-"""Validated cron expressions for periodic schedules (REQUIREMENTS.md §6).
+"""Validated cron expressions for periodic schedules (docs/requirements.md §6).
 
 Standard five-field cron (minute hour day-of-month month day-of-week) plus the
 usual ``@hourly``/``@daily``/... macros. Written here rather than taken as a

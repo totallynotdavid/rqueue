@@ -1,4 +1,4 @@
-"""The master pipeline test from REQUIREMENTS.md §11.
+"""The master pipeline test from docs/requirements.md §11.
 
 One test that walks the whole lifecycle in a single run and asserts on durable
 state after every step. It is the outer-loop signal during development -- run

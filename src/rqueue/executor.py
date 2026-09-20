@@ -1,4 +1,4 @@
-"""The bounded default executor the Worker installs (REQUIREMENTS.md §4).
+"""The bounded default executor the Worker installs (docs/requirements.md §4).
 
 Handlers are async only. Blocking work goes through ``asyncio.to_thread``,
 which submits to the running loop's *default* executor -- and the default

@@ -1,4 +1,4 @@
-"""What a handler is given (REQUIREMENTS.md §4).
+"""What a handler is given (docs/requirements.md §4).
 
 :class:`TaskContext` exposes job identity, the attempt number, a lease-aware
 heartbeat, a logger with structured fields, cooperative cancellation state, and

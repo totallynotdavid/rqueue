@@ -102,7 +102,7 @@ async def test_migrating_an_empty_database_installs_everything(
     The names are derived rather than transcribed. A second copy of the list
     here only ever caught "a migration was added", which is not a defect, and
     the ordered names are already pinned against a place a reader can check
-    them: the README's migrate transcript.
+    them: the migrate transcript in docs/migrations.md.
     """
     connection, schema = scratch_schema
     applied = await migrations.migrate(connection, schema=schema)
@@ -3759,7 +3759,7 @@ async def test_a_bounded_purge_still_progresses_on_identically_aged_jobs(
 async def test_purging_needs_a_queue_grant_not_just_a_privilege(
     admin_dsn: str, pool: asyncpg.Pool, queue_name: str
 ) -> None:
-    """0006 changed who may purge, and the README says so.
+    """0006 changed who may purge, and docs/migrations.md says so.
 
     Retention used to be a plain DELETE, so any role holding that privilege
     could run it. The routine authorizes the login role against

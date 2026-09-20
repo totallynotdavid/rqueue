@@ -1,4 +1,4 @@
-"""Resource bounds and the validators that enforce them (REQUIREMENTS.md §8).
+"""Resource bounds and the validators that enforce them (docs/requirements.md §8).
 
 A bound on a persisted column is mirrored as a CHECK constraint in the
 migrations, so a direct SQL writer cannot get past it either. Bounds on

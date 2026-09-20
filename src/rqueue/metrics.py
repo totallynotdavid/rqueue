@@ -1,4 +1,4 @@
-"""Structured metrics and logging hooks (REQUIREMENTS.md §7).
+"""Structured metrics and logging hooks (docs/requirements.md §7).
 
 No metrics vendor is required or assumed. The queue calls a small sink
 protocol; the default drops everything, and :class:`LoggingMetricsSink` turns

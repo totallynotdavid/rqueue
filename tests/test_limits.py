@@ -1,4 +1,4 @@
-"""Resource bounds from REQUIREMENTS.md §8."""
+"""Resource bounds from docs/requirements.md §8."""
 
 from __future__ import annotations
 
