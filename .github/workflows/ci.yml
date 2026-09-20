@@ -1,0 +1,100 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Keep in step with mise.toml.
+env:
+  UV_VERSION: "0.11.29"
+  PYTHON_VERSION: "3.14.6"
+
+permissions: {}
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: ${{ env.PYTHON_VERSION }}
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      # Same commands as the `lint` task in mise.toml.
+      - run: uv sync --group dev --locked
+      - run: uv run ruff check --select E,F,W,I,B,UP,S,SIM,RUF .
+      - run: uv run ruff format --check .
+      - run: uv run mypy --strict src tests
+
+  test:
+    name: Test (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        # The requires-python floor, and the version mise.toml pins for development.
+        python-version: ["3.13", "3.14.6"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: ${{ matrix.python-version }}
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - run: uv sync --group dev --locked
+      - run: uv run pytest -n auto -m 'not integration'
+
+  integration:
+    name: Integration
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    services:
+      postgres:
+        # Same major version as postgres in mise.toml.
+        image: postgres:18
+        env:
+          POSTGRES_USER: rqueue
+          POSTGRES_PASSWORD: rqueue
+          POSTGRES_DB: rqueue
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U rqueue -d rqueue"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: ${{ env.PYTHON_VERSION }}
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - run: uv sync --group dev --locked
+
+      # Setting RQUEUE_DATABASE_URL makes the script skip `mise run db:start` and
+      # use this service container instead.
+      - run: bash scripts/integration.sh
+        env:
+          RQUEUE_DATABASE_URL: postgresql://rqueue:rqueue@localhost:5432/rqueue
