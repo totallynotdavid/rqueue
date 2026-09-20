@@ -14,7 +14,7 @@ queue = RecordingQueue(name="compute")
 queue.register(name="prepare_simulation", handler=prepare_simulation)
 
 
-# The same app/queueing.py callback as in docs/enqueueing.md, unchanged.
+# The same app/queueing.py callback as in Enqueueing, unchanged.
 async def enqueue_simulation(connection, compute_job_id):
     return await queue.enqueue(
         connection,
@@ -59,8 +59,7 @@ leases, state transitions, or scheduling. Two calls sharing a `dedupe_key`
 record two jobs, and `on_conflict="raise"` never raises. Returned `Job` values
 are synthesized locally, with a fresh id, `state=pending`, and local timestamps.
 
-For any of that, write an integration test against real PostgreSQL with
-`mise run test-integration`.
+For any of that, write an integration test against a real PostgreSQL database.
 
 ## Reading the recording
 

@@ -13,8 +13,8 @@ await provision_role(
 
 The migration role owns the schema and is the only role that runs DDL. Queue
 scoping is enforced by row-level-security policies driven by rows in
-`role_queue_grants`, so the queues a role may touch arrive as bind parameters
-instead of interpolated SQL.
+`role_queue_grants`, so granting a queue is a row insert and never a policy
+change.
 
 After upgrading rqueue, re-run `provision_role` for every role. See
 [Re-provisioning roles](migrations.md#re-provisioning-roles).
@@ -59,8 +59,10 @@ queue name, and there is no queue by that name.
 Omitting the queue purges every queue that has anything to purge, which for a
 scoped role means every queue it can see. `limit` is spent across them as one
 budget, oldest job first regardless of which queue it is on, and that many jobs
-are deleted when that many exist. None of that follows from visiting the queues
-in a good order. The cutoff is first tightened to the age of the budget's last
+are deleted when that many exist.
+
+That ordering comes from the cutoff and not from the order the queues are visited
+in. The cutoff is first tightened to the age of the budget's last
 row, inclusive of every job finishing in the same instant, since a transaction
 that finishes a hundred jobs gives them all one `finished_at`. No queue can
 reach past that cutoff however much backlog it has. Tightening it also keeps the
@@ -162,5 +164,4 @@ is only partly narrowed.
 The whole call is one transaction, so that holds for every other failure too.
 Granting `PURGE` against a schema whose migrations stop short of the purge
 routine is the one you meet mid-deploy. It raises, and the role is left exactly
-as the call found it: absent if it did not exist, untouched if it did. It does
-not end up existing, able to log in, and carrying half a capability set.
+as the call found it: absent if it did not exist, untouched if it did.

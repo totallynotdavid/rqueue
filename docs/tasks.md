@@ -87,5 +87,5 @@ omitted options adopts the existing registration's values, and an explicit
 conflict raises `ValidationError`.
 
 Without `declare_task()`, a plain `register()` keeps its retry policy local to
-the worker. That preserves the behavior from before declarations existed. The
-job's `NULL` retry policy lets the worker use its current backoff settings.
+the worker. The job's `NULL` retry policy lets the worker use its current
+backoff settings.

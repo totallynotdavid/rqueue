@@ -21,9 +21,29 @@ internal SQL is static and parameterized.
 
 ## Module layout
 
-* `src/rqueue/storage.py`: the runtime read/write path.
-* `src/rqueue/migrations/`: schema DDL.
-* `src/rqueue/roles.py`: role grants.
+| Module | Holds |
+| --- | --- |
+| `queue.py` | `Queue`: task registration and transactional enqueue |
+| `worker.py` | `Worker`: claim, run, and finalize jobs under a lease |
+| `scheduler.py` | `Scheduler`: periodic schedules fired through the occurrence-key table |
+| `storage.py` | the only module that reads or writes job and schedule rows, and where every runtime SQL statement lives |
+| `migrations/` | schema DDL and the migration runner |
+| `roles.py` | capability grants and `provision_role` |
+| `admin.py` | `Admin`: inspection and administration |
+| `health.py` | `check_readiness` |
+| `tasks.py` | the task registry: explicit names, explicit decoders, async handlers only |
+| `context.py` | `TaskContext`, what a handler is given |
+| `retry.py` | `RetryPolicy` |
+| `executor.py` | the bounded default executor the worker installs |
+| `metrics.py` | `MetricsSink` and `LoggingMetricsSink` |
+| `limits.py` | resource bounds and their validators |
+| `models.py` | job state, jobs, attempts, schedules, and statistics |
+| `cron.py` | validated cron expressions |
+| `errors.py` | the exception hierarchy |
+| `cli.py` | the `rqueue` command |
+| `testing.py` | `RecordingQueue`, which the package does not export |
+
+All paths are under `src/rqueue/`.
 
 [Requirements §8](requirements.md) states the invariants each table's writers
 must keep.

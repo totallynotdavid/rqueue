@@ -21,7 +21,10 @@ produces in **one transaction**. Several scheduler replicas are safe. They
 collide on that unique key and exactly one wins. A scheduler that dies mid-tick
 leaves nothing behind, so the next tick retries the same occurrence. There is no
 leader election and no schedule-row reclaim, and the occurrence table is an
-audit trail of what fired when.
+audit trail of what fired when. The transaction is `fire_occurrence` in
+[`src/rqueue/storage.py`](../src/rqueue/storage.py), and
+[Requirements §6](requirements.md) compares this design with advisory locks,
+leader election, and claiming the schedule row.
 
 After an outage, `catchup` (default 1) bounds how many missed occurrences one
 tick fires. A new schedule never fires for occurrences that predate it.

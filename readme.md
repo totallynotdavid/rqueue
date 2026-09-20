@@ -17,14 +17,17 @@ adopting Procrastinate or pgqueuer.
 
 * **Delivery is at least once.** A handler may run again after a crash, a lease
   expiry, or an ambiguous network failure. Handlers and their external side
-  effects must be idempotent. rqueue does not offer exactly-once execution and
-  never will.
+  effects must be idempotent. rqueue does not offer exactly-once execution.
 * **Leases are fenced.** A claim mints a fresh `lease_token`. Every write a
-  worker makes carries it, and a SQL predicate on it gates every such write. A
-  worker that stalls past its lease cannot overwrite the attempt that replaced
-  it. River and pgqueuer do not provide this guarantee.
+  worker makes carries it, and a SQL predicate on it gates every such write. The
+  predicates are the `heartbeat` and finalizing statements in
+  [`src/rqueue/storage.py`](src/rqueue/storage.py). A worker that stalls past its
+  lease cannot overwrite the attempt that replaced it. River and pgqueuer do not
+  provide this guarantee. [Requirements §1](docs/requirements.md) compares the
+  three.
 * **State transitions are enforced in SQL**, not only in Python. A terminal job
-  becomes runnable again through exactly one path: the explicit operator retry.
+  becomes runnable again through exactly one path: the explicit operator retry
+  (`Admin.retry_job`, see [Operations](docs/operations.md)).
 
 ## Requirements
 

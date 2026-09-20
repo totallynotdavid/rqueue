@@ -29,8 +29,9 @@ worker = Worker(
 await worker.shutdown(timeout=10)
 ```
 
-Detach does not kill or interrupt the Python thread. It only stops waiting for
-the worker-owned executor after the shutdown grace period. **After a detached
+Detach does not kill or interrupt the Python thread, because Python cannot safely
+kill an arbitrary thread. It only stops waiting for the worker-owned executor
+after the shutdown grace period. **After a detached
 shutdown, the process must be terminated by its supervisor. Do not reuse the
 Worker or its detached executor, and do not start new queue work in that
 process.** `shutdown(wait_for_blocking_threads=...)` can override the
@@ -47,12 +48,11 @@ async def simulate(payload, context):
 ```
 
 `Worker` installs a `ThreadPoolExecutor` sized from `concurrency` as the event
-loop's default executor. A bare `asyncio.to_thread(...)` is therefore
+loop's default executor (see [`src/rqueue/executor.py`](../src/rqueue/executor.py)). A bare `asyncio.to_thread(...)` is therefore
 capacity-limited without every task author building an executor of their own.
 Set `executor_max_workers` to size it independently, or
 `install_default_executor=False` to leave the loop alone.
 
 Shutdown waits for these blocking threads by default. Cancelling the handler
-coroutine does not make `run()` return while its thread is still running. Use
-`executor_shutdown="detach"` only when the supervisor will terminate the process
-after lease hand-back, because Python cannot safely kill an arbitrary thread.
+coroutine does not make `run()` return while its thread is still running.
+[Stopping](#stopping) describes the detach mode for deployments that cannot wait.

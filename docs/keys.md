@@ -9,7 +9,9 @@ them `queueing_lock` and `lock`.
 queue and held for exactly as long as the job is active, which means `pending`
 or `leased`. The moment the job reaches a terminal state the key is free again.
 "One simulation queued per external id" therefore does not block the next run of
-the same simulation tomorrow.
+the same simulation tomorrow. The rule is the partial unique index
+`jobs_dedupe_active_uq` in
+[`0001_core.sql`](../src/rqueue/migrations/0001_core.sql).
 
 `on_conflict` has no default and must be given whenever `dedupe_key` is:
 
@@ -25,7 +27,9 @@ absorbs an enqueue.
 resource, such as "one simulation at a time per compute job". It is a lease, not
 a flag. The holder's slot is released when the job finishes and expires on its
 own if the holder dies, so a crashed worker cannot hold a business resource
-hostage.
+hostage. The slot is acquired inside the claim transaction and released inside
+the finalize transaction (`acquire_slot` and `release_slot` in
+[`src/rqueue/storage.py`](../src/rqueue/storage.py)).
 
 Like `dedupe_key`, it is scoped to one queue. Two queues using the same key name
 do not exclude each other. A queue is the boundary a least-privilege role is
