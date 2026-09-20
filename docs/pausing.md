@@ -13,13 +13,15 @@ await admin.pause_queue("*")         # every queue
 
 The switch is a durable row (`queue_pauses.paused_at`), and the claim query
 itself reads it. The pause therefore holds for a worker replica that has never
-heard of the call, and it survives a restart of all of them. Here a paused queue
-returns zero claimable rows at the database.
+heard of the call, and it survives a restart of all of them. A paused queue
+returns zero claimable rows at the database. The gate is the `NOT EXISTS`
+predicate in the `claim_candidates` statement in
+[`src/rqueue/storage.py`](../src/rqueue/storage.py).
 
-That is stronger than the references. Oban keeps the flag in each producer
+That is stronger than Oban or River. Oban keeps the flag in each producer
 process, so a restarted queue comes back running. River stores the row but
 checks it in the client, so a worker that has not polled yet can still issue a
-claim.
+claim. [Requirements §4](requirements.md) gives the full comparison.
 
 `NOTIFY` is a latency optimization only, exactly as it is for job wake-ups. It
 saves an *idle* worker the rest of its poll interval when you resume. Nothing
@@ -28,8 +30,8 @@ depends on its arrival.
 ## What pause does not do
 
 Pause does not touch an in-flight attempt. A job leased before the pause runs,
-heartbeats, and finalizes normally. Pause is about admission,
-`Worker.stop()` and `Worker.drain()` are about a worker's own lifecycle, and
+heartbeats, and finalizes normally. Pause is about admission.
+`Worker.stop()` and `Worker.drain()` are about a worker's own lifecycle.
 `Admin.cancel_job` is about one job.
 
 ## Wildcard and named pauses

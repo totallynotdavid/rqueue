@@ -20,7 +20,7 @@ caller-supplied connection inside the caller's transaction
 `AsyncpgDriver`. The actual reason to build this package is narrower and more
 honest: **avoid running two PostgreSQL drivers in one process.** The
 consuming application (picv-2025) already speaks asyncpg end to end via
-`relq`; adding Procrastinate means a second driver, a second connection pool,
+`relq`. Adding Procrastinate means a second driver, a second connection pool,
 and a second set of type codecs to reason about. A queue that speaks asyncpg
 natively lets the queue and the application share one pool and one
 `Connection` type.
@@ -74,7 +74,7 @@ than adopting:
 - The package owns versioned PostgreSQL migrations. It must not perform
   implicit schema creation at import time or on normal worker startup.
 - `relq` is optional from the queue package's perspective. The queue accepts
-  an `asyncpg.Connection`; applications may use that exact connection through
+  an `asyncpg.Connection`. Applications may use that exact connection through
   `relq_postgres.PostgresDatabase` inside the same transaction.
 
 **Revised:** the original draft pinned Python 3.15+. As of this writing
@@ -103,12 +103,12 @@ bounded-concurrency loop.
 
 **Revised:** `pgqueuer` stores payload as opaque `BYTEA` and leaves
 serialization entirely to the application. That's a legitimate but looser
-tradeoff; this package keeps the stricter JSON-only requirement from the
-original draft (no pickle, no arbitrary bytes) deliberately.
+tradeoff. This package deliberately keeps the stricter JSON-only requirement
+from the original draft (no pickle, no arbitrary bytes).
 
 ### Atomic enqueueing
 
-The enqueue API takes a caller-owned `asyncpg.Connection`; it never opens a
+The enqueue API takes a caller-owned `asyncpg.Connection`. It never opens a
 second connection:
 
 ```python
@@ -140,7 +140,7 @@ something that happens to work.
   writing any row.
 - A durable `dedupe_key` is scoped to a queue and has a documented lifecycle.
   Concurrent enqueue attempts with the same active key return the existing job
-  or raise `AlreadyEnqueued`; the choice must be explicit per call.
+  or raise `AlreadyEnqueued`. The choice must be explicit per call.
 - PostgreSQL `NOTIFY` may wake workers after commit, but polling remains the
   source of truth. A missed notification must only add latency, never lose a
   job.
@@ -167,7 +167,7 @@ heartbeat-only UPDATE.
   transaction open while user code runs.
 
 **This is the package's strongest guarantee relative to prior art.** See §1.
-Neither River nor pgqueuer implement lease-token fencing; both rely on
+Neither River nor pgqueuer implement lease-token fencing. Both rely on
 heartbeat-timeout reclaim alone. Do not weaken this to match them.
 
 ## 4. Public API
@@ -189,7 +189,7 @@ await worker.run()
 ```
 
 - `Worker.stop()` requests a graceful stop. `await worker.shutdown()` is the
-  awaitable lifecycle operation for a worker running in a background task; its
+  awaitable lifecycle operation for a worker running in a background task. Its
   `timeout` bounds the in-flight handler grace period.
 - `executor_shutdown="wait"` is the safe default. After handing leases back,
   the worker waits for blocking work submitted through `asyncio.to_thread`.
@@ -202,7 +202,7 @@ await worker.run()
   if a queued task name has no registered handler, unless configured to leave
   it pending for a different worker deployment.
 - Task payload validation is explicit. The package provides a JSON payload
-  protocol; applications may supply a Pydantic TypeAdapter or a plain decoder.
+  protocol. Applications may supply a Pydantic TypeAdapter or a plain decoder.
   Decode failures are non-retryable and become a durable failed job.
 - `TaskContext` exposes only job id, attempt number, queue, lease-aware
   heartbeat, logger/structured fields, cooperative cancellation state, and the
@@ -220,7 +220,7 @@ await worker.run()
   older than a retention period, and pause/resume a queue. These are not part
   of handler context.
 
-**Revised:** the original draft already specified async-only handlers; an
+**Revised:** the original draft already specified async-only handlers. An
 intermediate revision of this document proposed adding first-class sync
 handler support (justified by picv-2025's numba-based handler being fully
 synchronous). That was reversed after reading `pgqueuer`'s executor code: it
@@ -228,7 +228,7 @@ used to support sync entrypoints and *removed the feature*, with the executor
 now raising `TypeError("Sync entrypoints are no longer supported... wrap
 blocking code with asyncio.to_thread()")`. That is direct evidence from a
 project that tried the "auto-detect and route to a thread" design and walked
-it back. Stay async-only; the one-line `asyncio.to_thread` wrapper is not
+it back. Stay async-only. The one-line `asyncio.to_thread` wrapper is not
 meaningful ceremony for a fully-synchronous handler, and it keeps the
 worker's execution model to one path instead of two.
 
@@ -245,15 +245,16 @@ or gating a deploy has no way to express that with the API as specified. The
 decision is to build it, as `Admin.pause_queue(name)` /
 `Admin.resume_queue(name)`, with `'*'` meaning every queue.
 
-The design, briefly: a durable `queue_pauses` table (`paused_at timestamptz`,
-NULL meaning running. It holds the instant, not a boolean, so an admin view gets
-"paused since" for free) is the single source of truth; the claim query itself
-carries the predicate, so a paused queue yields zero claimable rows in SQL
-regardless of what any worker process currently believes; `NOTIFY` on resume is
-a latency optimization for an idle worker and nothing more. That follows §3's
-existing rule for job wake-ups ("polling is the source of truth") and this
-document's stance that state transitions are enforced in SQL, not only in
-Python. That is also why Oban's model was *not* copied: Oban keeps `paused`
+The design, briefly: a durable `queue_pauses` table is the single source of
+truth. Its `paused_at timestamptz` column is NULL when the queue is running, and
+it holds the instant rather than a boolean so an admin view gets "paused since"
+for free. The claim query itself carries the predicate, so a paused queue yields
+zero claimable rows in SQL regardless of what any worker process currently
+believes. `NOTIFY` on resume is a latency optimization for an idle worker and
+nothing more. That follows §3's existing rule for job wake-ups ("polling is the
+source of truth") and this document's stance that state transitions are
+enforced in SQL, not only in Python. That is also why Oban's model was *not*
+copied: Oban keeps `paused`
 in each producer process and rebroadcasts it over PubSub, so a restarted queue
 comes back running. It goes one step past River too: River stores the row but
 still tests it client-side before fetching, so a worker that has not yet polled
@@ -263,7 +264,7 @@ per claim and holds for workers that have never heard of the call.
 
 Deliberately *not* adopted from Oban: starting a `Worker` already paused
 (`Oban.start_queue(paused: true)`). In Oban the flag is per-producer state, so
-a constructor argument is the only way to express it; here the pause is durable
+a constructor argument is the only way to express it. Here the pause is durable
 and queue-wide, so `await admin.pause_queue(name)` before starting a worker
 already says it, exactly once, for the whole fleet. A per-`Worker` argument
 would either write global state from one replica's constructor or gate
@@ -279,15 +280,15 @@ admission in Python, and both are worse than the call that already exists.
 - Exception details recorded in PostgreSQL are bounded and sanitized. Full
   tracebacks belong in structured worker logs, not unbounded database fields
   or user-facing responses.
-- Cancellation is cooperative. Cancelling a queued job prevents execution;
-  cancelling a leased job signals its handler and is finalized only by the
+- Cancellation is cooperative. Cancelling a queued job prevents execution.
+  Cancelling a leased job signals its handler and is finalized only by the
   lease-holder or lease expiry.
 - Timeouts must be explicit per task. Timeout cancellation cannot be treated
   as proof that an external side effect did not occur.
 
 ## 6. Scheduling and concurrency controls
 
-- Delayed jobs use `scheduled_at`; workers claim only due jobs.
+- Delayed jobs use `scheduled_at`. Workers claim only due jobs.
 - Periodic jobs support a validated cron expression and timezone. A scheduler
   emits one durable job occurrence at a time via a unique **occurrence key**:
   one row per `(schedule_id, occurrence_time)` with a unique constraint,
@@ -297,18 +298,18 @@ admission in Python, and both are worse than the call that already exists.
   substitute for a general workflow/DAG system.
 - Optional named concurrency keys limit an externally shared resource (for
   example, one simulation per compute job). Their semantics must be lease
-  based and crash safe; do not model them as a permanently held Boolean.
+  based and crash safe. Do not model them as a permanently held Boolean.
   These are a distinct primitive from `dedupe_key`. Dedupe prevents a
-  duplicate *job from being queued*, a concurrency key prevents duplicate
+  duplicate *job from being queued*. A concurrency key prevents duplicate
   *concurrent execution*. Procrastinate models this split as `queueing_lock`
-  vs. `lock`; keep the two-key model, don't collapse them.
+  vs. `lock`. Keep the two-key model and do not collapse them.
 - Priority is a small integer and is resolved alongside `scheduled_at` and
   creation order. Fairness between queues must be documented, not implied.
 
 **Revised:** the original draft offered "a PostgreSQL advisory lock or unique
-occurrence key" as alternatives for periodic-job dedup; this revision commits
+occurrence key" as alternatives for periodic-job dedup. This revision commits
 to occurrence-key only, and rules out both the advisory-lock approach and the
-alternative seen in prior art. Three approaches were compared directly:
+alternative seen in prior art. Four approaches were compared directly:
 
 - **Session advisory lock** (originally proposed): fragile under any
   connection pooling. The lock is session-scoped, and a scheduler that ever
@@ -346,7 +347,7 @@ alternative seen in prior art. Three approaches were compared directly:
 - A migration that the previous release's *running* code cannot survive must
   detect that code and refuse, rather than apply and break it. Runtime
   liveness is already recorded, so "is the old fleet still up?" is a question
-  the database can answer; the refusal names the required order, in the
+  the database can answer. The refusal names the required order, in the
   deployment's own schema rather than the default one. What such a check can
   prove must be stated exactly: absence of a trace is not absence of a
   process. The gap it leaves is named as the drain window. Testing "from
@@ -362,8 +363,8 @@ alternative seen in prior art. Three approaches were compared directly:
   changing: a component idle between units of work leaves no trace in the
   latter.
 - Retention is oldest-first across the whole schema, not only within one
-  queue; a bounded purge reads work proportional to its limit rather than to
-  the backlog behind it; and it delivers that limit when the rows exist. All
+  queue. A bounded purge reads work proportional to its limit rather than to
+  the backlog behind it. It also delivers that limit when the rows exist. All
   three follow from bounding the delete by the age of the budget's last row,
   inclusive of every row sharing that instant. Jobs finished in one
   transaction share a `finished_at`, so a tie group routinely straddles the
@@ -389,15 +390,15 @@ alternative seen in prior art. Three approaches were compared directly:
   scheduling horizon, poll batch size, and worker concurrency.
 - Use parameterized SQL exclusively. Internal SQL is static, reviewed, and
   isolated in the storage implementation.
-- Support PostgreSQL roles with least privilege: API producers may enqueue and
-  inspect only their allowed queues; workers may claim/transition their queues;
-  migration role owns DDL. A worker capability grants no `INSERT` on `jobs`.
+- Support PostgreSQL roles with least privilege. API producers may enqueue and
+  inspect only their allowed queues. Workers may claim and transition jobs on
+  their queues. The migration role owns DDL. A worker capability grants no `INSERT` on `jobs`.
   Claiming work and creating it are separate authorities, and a role that needs
   both asks for both capabilities.
 - Retention deletion is a capability of its own, and it is not a table-wide
   `DELETE`. The purge capability grants `EXECUTE` on a `SECURITY DEFINER`
   routine that re-derives queue, terminal state, age cutoff, and batch size
-  from its own arguments; the routine is the safety boundary, so a crafted call
+  from its own arguments. The routine is the safety boundary, so a crafted call
   cannot reach a non-terminal job, another queue's jobs, or an unbounded batch.
   The package's own retention API goes through that routine and no other path,
   so holding the capability is sufficient to run it. A capability whose only
@@ -407,7 +408,7 @@ alternative seen in prior art. Three approaches were compared directly:
   loses an ability it had.
 - A bound duplicated between Python and a migration must be tested to agree.
   Migrations are checksummed and forward-only, so the SQL side can never be
-  corrected afterwards; an unchecked pair silently degrades a typed error into
+  corrected afterwards. An unchecked pair silently degrades a typed error into
   a raw database one.
 - Ownership is not a grant and cannot be pruned like one. Provisioning must
   refuse a role that owns the schema, the database, or an object in the
@@ -419,7 +420,7 @@ alternative seen in prior art. Three approaches were compared directly:
   catalog is a list that falls behind the server, so the ownership record
   PostgreSQL keeps for every object alike is the one to read.
 - The capability grant table belongs to the release, and the schema version
-  does not track it. `migrate` moves the schema; the privileges an existing
+  does not track it. `migrate` moves the schema. The privileges an existing
   role holds only move when `provision_role` runs again, so every release that
   changes the table states what an un-reprovisioned role loses. A migration may
   repair what it can derive: a capability that implies a privilege nothing else
@@ -428,11 +429,11 @@ alternative seen in prior art. Three approaches were compared directly:
   because a privilege two capabilities both confer is indistinguishable, and
   the capability set is the caller's. It is never recorded, so never the
   database's to infer. A change the fingerprint cannot repair is documented
-  with its failure mode; one that leaves a component unable to work at all
+  with its failure mode. A change that leaves a component unable to work at all
   rather than degraded is repaired.
 - Provisioning a role is one transaction. It issues a dozen statements across
   the role, the database, the schema, each table, each routine, and the queue
-  grants; a failure part way through must leave the role exactly as it was
+  grants. A failure part way through must leave the role exactly as it was
   rather than existing, able to log in, and holding whichever half of the
   capability set was applied first.
 - Narrowing a role means every privilege class, not the ones a grant model
@@ -448,37 +449,38 @@ alternative seen in prior art. Three approaches were compared directly:
   a partly narrowed role, because the next thing done with that role is handing
   out its credentials.
 - Row-level security covers the six tables that hold queue-scoped *work*, not
-  only `jobs` and `job_attempts`: concurrency slots, runtime heartbeats,
+  only `jobs` and `job_attempts`. Concurrency slots, runtime heartbeats,
   schedules, and schedule occurrences are queue-scoped by the same
-  `role_queue_grants` policy. Two queue-carrying tables are outside it by
-  design and readable in full: `queue_pauses`, because a policy scoped to a
-  role's own queues would hide the `'*'` global pause from the workers that
-  must honour it, and `role_queue_grants` itself, because every policy above is
-  a subquery against it evaluated as the querying role, so under RLS it would
-  filter itself and every policy would match nothing. Both leak the shape of
-  the deployment (which queues exist, which are paused, which roles hold
-  what), and neither is writable by a scoped role. `role_runtime_kinds`, which
-  records the kinds a role may claim liveness as, is outside it for the same
-  reason as the second of those and carries no queue; it is not directly
-  readable either, since the policies reach it through a `SECURITY DEFINER`
-  function. Where such a table's own
-  key was global it is narrowed to include the
-  queue, so that the key an upsert resolves against and the policy that decides
-  visibility agree on what identifies a row; a concurrency key is therefore
+  `role_queue_grants` policy.
+- Two queue-carrying tables are outside the policies by design and readable in
+  full. `queue_pauses` is outside because a policy scoped to a role's own
+  queues would hide the `'*'` global pause from the workers that must honour
+  it. `role_queue_grants` is outside because every policy above is a subquery
+  against it evaluated as the querying role, so under RLS it would filter
+  itself and every policy would match nothing. Both leak the shape of the
+  deployment (which queues exist, which are paused, which roles hold what), and
+  neither is writable by a scoped role.
+- `role_runtime_kinds`, which records the kinds a role may claim liveness as, is
+  outside the policies for the same reason as `role_queue_grants` and carries no
+  queue. It is not directly readable either, since the policies reach it
+  through a `SECURITY DEFINER` function.
+- Where such a table's own key was global, it is narrowed to include the queue,
+  so that the key an upsert resolves against and the policy that decides
+  visibility agree on what identifies a row. A concurrency key is therefore
   scoped to its queue, as `dedupe_key` already was, and a heartbeat is one
-  component's liveness on one queue. Where such a row also references a job or
-  a schedule, its queue must be tied to that reference by constraint, not
-  merely written by the caller: a policy can only test the label, so a label
-  the writer chooses is not a boundary. This matters wherever such a row also
-  carries a globally unique key (an attempt number, a slot key, an occurrence
-  instant), because forging the label consumes that key and denies service to
-  the queue that owns it.
+  component's liveness on one queue.
+- Where such a row also references a job or a schedule, its queue must be tied
+  to that reference by constraint, not merely written by the caller. A policy
+  can only test the label, so a label the writer chooses is not a boundary.
+  This matters wherever such a row also carries a globally unique key (an
+  attempt number, a slot key, an occurrence instant), because forging the label
+  consumes that key and denies service to the queue that owns it.
 - Liveness is recorded per queue, so a component that serves several records
   one heartbeat per queue served, and an unfiltered liveness query counts each
   instance once. A component serving no queue records nothing rather than
   claiming a queue it does not feed.
 - Where a queue label is tied to a reference, the reference must be one whose
-  queue cannot change. A job qualifies; a schedule does not.
+  queue cannot change. A job qualifies. A schedule does not.
 - A uniqueness guarantee that spans queues must not be scoped by queue. The
   occurrence key is one: scoping it would let a schedule moved between queues
   fire its history again. Such a key is protected by a policy that asks what
@@ -492,8 +494,8 @@ the same content stated once as a whole, because a concurrency invariant that
 is only ever described in pieces is one nobody can check.
 
 For each, the complete state set, who may cause each transition, and what is
-ordered with respect to what. "Operator" means an `Admin` call or the CLI;
-"migration role" means the identity that runs DDL.
+ordered with respect to what. "Operator" means an `Admin` call or the CLI.
+"Migration role" means the identity that runs DDL.
 
 **`concurrency_slots`**: a row *is* the lease on a named key.
 
@@ -501,11 +503,11 @@ ordered with respect to what. "Operator" means an `Admin` call or the CLI;
 | --- | --- |
 | absent | the key is free |
 | held | a row whose `leased_until` is in the future |
-| expired | a row whose `leased_until` has passed; free, but not yet reaped |
+| expired | a row whose `leased_until` has passed, so it is free but not yet reaped |
 
 - Worker, claiming: absent or expired → held, as one `INSERT ... ON CONFLICT
   (queue, key) DO UPDATE ... WHERE leased_until <= now()`. Two workers racing
-  for one key serialize on the row; the loser claims no job.
+  for one key serialize on the row. The loser claims no job.
 - Worker, finalizing: held → absent, `DELETE` matched on `job_id` *and*
   `lease_token`. A worker whose lease expired cannot release the slot its
   successor now holds.
@@ -528,7 +530,7 @@ ordered with respect to what. "Operator" means an `Admin` call or the CLI;
 | --- | --- |
 | absent | that component is not serving that queue |
 | fresh | `updated_at` within the caller's staleness window |
-| stale | older than it; the component is presumed dead |
+| stale | older than it, so the component is presumed dead |
 
 - Worker or scheduler: absent or stale → fresh, upserting its own row once per
   tick, for each queue it serves and no other.
@@ -554,13 +556,13 @@ ordered with respect to what. "Operator" means an `Admin` call or the CLI;
   not a third option when the two disagree about what a row is.
 - A privilege a running role may lack is asked for only when it is needed. A
   schema migration cannot re-grant anything to an existing role, so a grant
-  added by one is absent until an operator re-provisions; a statement issued
+  added by one is absent until an operator re-provisions. A statement issued
   unconditionally would fail every tick of every deployment, including the ones
   with nothing to do. When it is needed and refused, the claim is left to go
   stale rather than the tick to fail.
 - Time: fresh → stale. This is the answer for a process that *died*. It cannot
   retract anything, so time must. It is not the answer for a running process
-  whose responsibilities changed; that one says so itself.
+  whose responsibilities changed. That one says so itself.
 - No component writes another's row, and no operator writes any of them. This
   is enforced, not merely intended: the row records the role that wrote it and
   a role may only write, refresh or retract its own. Queue scope alone cannot
@@ -594,7 +596,7 @@ the exactly-once guarantee for scheduling.
 | absent | that occurrence has not fired |
 | fired | it has, in the same transaction as the job it created |
 
-- Scheduler: absent → fired, insert-only. There is no update and no delete; the
+- Scheduler: absent → fired, insert-only. There is no update and no delete. The
   `SCHEDULE` capability grants neither.
 - A plain `INSERT`, not `ON CONFLICT DO NOTHING`, so a second scheduler waits
   on the first's uncommitted row and proceeds only if that transaction aborted.
@@ -607,11 +609,11 @@ the exactly-once guarantee for scheduling.
 | State | Meaning |
 | --- | --- |
 | absent | the queue admits work |
-| paused | a row with `paused_at` set; claims yield nothing |
+| paused | a row with `paused_at` set, so claims yield nothing |
 
 - Operator only, either direction. Pausing twice keeps the first `paused_at`.
 - `'*'` is a row like any other and means every queue. Resuming `'*'` clears
-  the named pauses too; resuming one queue does not lift the wildcard.
+  the named pauses too. Resuming one queue does not lift the wildcard.
 - The gate is in the claim SQL, so it binds every worker whatever a `Worker`
   believes. It never touches a job already leased.
 
@@ -687,14 +689,14 @@ against real PostgreSQL must prove:
 3. Two concurrent producers cannot create duplicate active jobs for one
    dedupe key.
 4. Multiple workers process a job at most once per successful lease attempt.
-5. A worker crash during a handler causes bounded retry after lease expiry;
-   the stale worker cannot complete the newer attempt. This is the fencing
+5. A worker crash during a handler causes bounded retry after lease expiry.
+   The stale worker cannot complete the newer attempt. This is the fencing
    guarantee from §3 and needs a test that actually holds a lease past
    expiry and attempts to write with the stale token, not just a timing test.
 6. Retry, timeout, cancellation, and terminal failure state transitions are
    durable and observable.
 7. A missed `NOTIFY`, worker restart, scheduler restart, and database restart
-   delay work at most; none loses work.
+   delay work at most. None loses work.
 8. Periodic schedules fire once per occurrence across multiple schedulers,
    including a scheduler crash between claiming an occurrence and enqueueing
    its job (§6). The occurrence must not be lost or double-fired.
@@ -721,7 +723,7 @@ working pattern for exactly this. Mirror it rather than inventing a new one.
   `scripts/integration.sh` (or equivalent `mise` task) that creates a fresh
   database, runs `rqueue`'s own migrations, runs the integration suite, and
   tears down, never against a shared or production-shaped database.
-- **Fast tests stay database-free**; integration tests are marked
+- **Fast tests stay database-free.** Integration tests are marked
   (`pytest.mark.integration`) and excluded from the default `mise run test`
   the same way picv-2025 splits `test` from `test-integration`.
 - **A master pipeline test, runnable in a loop during development.** One
@@ -747,6 +749,6 @@ a hand-rolled fake that proves nothing about the call's shape. Added
 database-free `Queue.build_insert` and records the validated request instead
 of writing it. It is explicitly **non-durable and non-simulating**. It proves
 a call is well-formed and would be accepted, and models no transactionality,
-dedupe resolution, claiming, or execution; those stay the job of the §10
+dedupe resolution, claiming, or execution. Those stay the job of the §10
 integration suite. It lives outside `rqueue/__init__.py`'s exports, following
 Procrastinate's precedent, so the production import surface is unchanged.

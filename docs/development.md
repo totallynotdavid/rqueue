@@ -9,7 +9,7 @@ $ mise run install           # sync the virtualenv
 $ mise run db:start          # start .data/postgres (init on first run)
 $ mise run test              # fast suite, no database
 $ mise run test-integration  # disposable database + scoped role, then teardown
-$ mise run test-pipeline     # just the §11 master pipeline test, for the inner loop
+$ mise run test-pipeline     # just the master pipeline test, for the inner loop
 $ mise run lint              # ruff check, ruff format --check, mypy --strict
 $ mise run db:reset          # delete the local cluster
 ```
@@ -24,4 +24,6 @@ its own service container.
 The fast suite is database-free and stays that way. Integration tests are marked
 `pytest.mark.integration` and excluded from the default run.
 
-The "§11" above refers to [Requirements §11](requirements.md).
+The master pipeline test runs the whole job lifecycle in one pass, so it is the
+quickest check after a change to claiming, leases, or the scheduler.
+[Requirements §11](requirements.md) specifies what it covers.
