@@ -1,8 +1,8 @@
-# rqueue — PostgreSQL task queue on asyncpg — package requirements
+# rqueue: package requirements for a PostgreSQL task queue on asyncpg
 
 Revision 2. Supersedes the original draft. Changes from the draft are called
-out inline as **Revised:** notes, each with the reasoning that produced them —
-keep those notes; they're the record of why the design is shaped this way,
+out inline as **Revised:** notes, each with the reasoning that produced them.
+Keep those notes. They are the record of why the design is shaped this way,
 not just what it says.
 
 ## 1. Purpose
@@ -13,7 +13,7 @@ can insert/update its own rows and enqueue a job through the **same**
 `asyncpg.Connection` and PostgreSQL transaction.
 
 **Revised:** the original draft framed this as filling a gap in Procrastinate
-("Procrastinate doesn't support transactional enqueueing"). That's false —
+("Procrastinate doesn't support transactional enqueueing"). That's false.
 Procrastinate's `PsycopgConnector` already supports deferring a job on a
 caller-supplied connection inside the caller's transaction
 (`configure(connection=conn).defer_async(...)`), and so does `pgqueuer`'s
@@ -35,15 +35,15 @@ distributed transaction coordinator.
 
 ### Why not adopt `pgqueuer` instead of building this?
 
-`pgqueuer` (janbjorge/pgqueuer, Python + asyncpg) is mature and well-engineered
-— MVCC-safe concurrency-slot allocation, batch CTE-based claiming, transactional
-enqueue on a caller connection already works today. It was evaluated directly
+`pgqueuer` (janbjorge/pgqueuer, Python + asyncpg) is mature and well-engineered.
+It has MVCC-safe concurrency-slot allocation and batch CTE-based claiming, and
+transactional enqueue on a caller connection already works today. It was evaluated directly
 (schema and query builder read in full) before starting this package. It has
 three gaps against the requirements below that are correctness/feature gaps,
 not style differences, and are the actual justification for building rather
 than adopting:
 
-1. **No fencing token.** Its crash recovery is heartbeat-only — the same
+1. **No fencing token.** Its crash recovery is heartbeat-only. It is the same
    coarse model River (Go) uses: a job is reclaimed when
    `heartbeat < NOW() - timeout`, with no token comparison. Nothing stops a
    worker that is merely slow (GC pause, stalled heartbeat writer, not
@@ -52,7 +52,7 @@ than adopting:
    most load-bearing guarantee and pgqueuer does not provide it.
 2. **No named concurrency key on an arbitrary business resource.** pgqueuer
    limits concurrency per *entrypoint* (task type) only. It has no equivalent
-   to Procrastinate's `lock=f"compute-job:{id}"` — mutual exclusion scoped to
+   to Procrastinate's `lock=f"compute-job:{id}"`. That lock is mutual exclusion scoped to
    an application-chosen key, which picv-2025 needs ("one simulation per
    compute job").
 3. **Dedup's skip mode drops silently.** `on_conflict="skip"` does
@@ -79,7 +79,7 @@ than adopting:
 
 **Revised:** the original draft pinned Python 3.15+. As of this writing
 (2026-08-31), Python 3.15 has not reached GA (expected ~October 2026 per the
-PEP 719 cadence) and no released `asyncpg` build supports it — the latest
+PEP 719 cadence) and no released `asyncpg` build supports it. The latest
 (0.31.0) tops out at 3.14. Pinning 3.15+ today means the dependency cannot be
 installed by anyone. 3.13+ was chosen instead: fully supported by current
 asyncpg, and gives `asyncio.TaskGroup`/exception groups for the worker's
@@ -128,12 +128,12 @@ If this transaction rolls back, no application row, queue row, or queue-job
 reference may survive. The worker must use a different pooled connection only
 after the transaction commits.
 
-**Idiomatic usage — keep business logic decoupled from the queue import.**
+**Idiomatic usage: keep business logic decoupled from the queue import.**
 picv-2025's `repository.py` never imports Procrastinate directly: its
 `create_or_get_job(*, data, simulation_id, defer)` takes a `defer` callback,
 and the caller passes a thin wrapper (`enqueue_simulation(conn, job_id)`) that
 calls the queue. This package's `enqueue` should be trivially wrappable in
-that shape — document it as the intended pattern in the quickstart, not just
+that shape. Document it as the intended pattern in the quickstart, not just
 something that happens to work.
 
 - `enqueue_many(connection, jobs)` is atomic and validates every job before
@@ -148,7 +148,7 @@ something that happens to work.
 **Revised:** fire `NOTIFY` selectively, not on every write. River's trigger
 only fires on transition into an "available" state, with a minimal payload
 (queue name, not the row). pgqueuer's fires on every INSERT/UPDATE/DELETE.
-Prefer River's tighter version — fewer wakeups, no reason to notify on a
+Prefer River's tighter version: fewer wakeups, and no reason to notify on a
 heartbeat-only UPDATE.
 
 ### Claiming, leases, and fencing
@@ -166,7 +166,7 @@ heartbeat-only UPDATE.
 - A worker uses a bounded-concurrency loop. It must not hold a database
   transaction open while user code runs.
 
-**This is the package's strongest guarantee relative to prior art** — see §1.
+**This is the package's strongest guarantee relative to prior art.** See §1.
 Neither River nor pgqueuer implement lease-token fencing; both rely on
 heartbeat-timeout reclaim alone. Do not weaken this to match them.
 
@@ -208,7 +208,7 @@ await worker.run()
   heartbeat, logger/structured fields, cooperative cancellation state, and the
   `will_retry()` decision hook. It must not expose raw SQL or permit mutation
   of queue internals.
-- **Handlers are `async def` only — no sync-handler code path.** If a task's
+- **Handlers are `async def` only, with no sync-handler code path.** If a task's
   work is blocking (CPU-bound simulation, subprocess, blocking I/O), the
   handler wraps it explicitly: `await asyncio.to_thread(blocking_fn, ...)`.
   `Worker` installs a bounded `ThreadPoolExecutor` (sized from `concurrency`)
@@ -234,9 +234,9 @@ worker's execution model to one path instead of two.
 
 **Revised (2026-09-02):** this document never considered **durable,
 queue-wide pause/resume**, and the omission was an oversight rather than a
-decision. Both mature references have it — Oban's `pause_queue`/`resume_queue`
-(with a `:*` wildcard for every queue) and River's `QueuePause`/`QueueResume`
-— and it is a different operation from anything specified above: it stops a
+decision. Both mature references have it: Oban's `pause_queue`/`resume_queue`
+(with a `:*` wildcard for every queue) and River's `QueuePause`/`QueueResume`.
+It is a different operation from anything specified above: it stops a
 queue admitting *new* work across every worker replica at once, without
 killing a process, where `Worker.stop()`/`Worker.drain()` only ever affect the
 one worker instance they are called on and `cancel_job` only ever affects one
@@ -246,14 +246,14 @@ decision is to build it, as `Admin.pause_queue(name)` /
 `Admin.resume_queue(name)`, with `'*'` meaning every queue.
 
 The design, briefly: a durable `queue_pauses` table (`paused_at timestamptz`,
-NULL meaning running — the instant, not a boolean, so an admin view gets
+NULL meaning running. It holds the instant, not a boolean, so an admin view gets
 "paused since" for free) is the single source of truth; the claim query itself
 carries the predicate, so a paused queue yields zero claimable rows in SQL
 regardless of what any worker process currently believes; `NOTIFY` on resume is
 a latency optimization for an idle worker and nothing more. That follows §3's
 existing rule for job wake-ups ("polling is the source of truth") and this
 document's stance that state transitions are enforced in SQL, not only in
-Python — which is also why Oban's model was *not* copied: Oban keeps `paused`
+Python. That is also why Oban's model was *not* copied: Oban keeps `paused`
 in each producer process and rebroadcasts it over PubSub, so a restarted queue
 comes back running. It goes one step past River too: River stores the row but
 still tests it client-side before fetching, so a worker that has not yet polled
@@ -265,7 +265,7 @@ Deliberately *not* adopted from Oban: starting a `Worker` already paused
 (`Oban.start_queue(paused: true)`). In Oban the flag is per-producer state, so
 a constructor argument is the only way to express it; here the pause is durable
 and queue-wide, so `await admin.pause_queue(name)` before starting a worker
-already says it — exactly once, for the whole fleet. A per-`Worker` argument
+already says it, exactly once, for the whole fleet. A per-`Worker` argument
 would either write global state from one replica's constructor or gate
 admission in Python, and both are worse than the call that already exists.
 
@@ -298,7 +298,7 @@ admission in Python, and both are worse than the call that already exists.
 - Optional named concurrency keys limit an externally shared resource (for
   example, one simulation per compute job). Their semantics must be lease
   based and crash safe; do not model them as a permanently held Boolean.
-  These are a distinct primitive from `dedupe_key` — dedupe prevents a
+  These are a distinct primitive from `dedupe_key`. Dedupe prevents a
   duplicate *job from being queued*, a concurrency key prevents duplicate
   *concurrent execution*. Procrastinate models this split as `queueing_lock`
   vs. `lock`; keep the two-key model, don't collapse them.
@@ -311,20 +311,20 @@ to occurrence-key only, and rules out both the advisory-lock approach and the
 alternative seen in prior art. Three approaches were compared directly:
 
 - **Session advisory lock** (originally proposed): fragile under any
-  connection pooling — the lock is session-scoped, and a scheduler that ever
+  connection pooling. The lock is session-scoped, and a scheduler that ever
   borrows a pooled connection silently loses the guarantee.
-- **Leader election** (River's approach — an `UNLOGGED river_leader` table,
+- **Leader election** (River's approach: an `UNLOGGED river_leader` table,
   single elected instance runs the scheduler): works, but is real machinery
   (election, liveness, failover) to avoid double-firing.
-- **Claim-the-schedule-row** (pgqueuer's approach — the schedule row itself
+- **Claim-the-schedule-row** (pgqueuer's approach: the schedule row itself
   is claimed via the same `SKIP LOCKED` + heartbeat-reclaim as jobs, and
   `next_run` is advanced optimistically at claim time): simpler than leader
-  election, but has a real gap — a crash between claiming the schedule row
+  election, but has a real gap: a crash between claiming the schedule row
   and durably creating its job can advance `next_run` without ever producing
   the occurrence, silently skipping a firing.
 - **Occurrence-key table** (kept): insert `(schedule_id, occurrence_time)`
   with a unique constraint, in the same transaction that creates the
-  occurrence's job. No reclaim logic needed at all — if the transaction
+  occurrence's job. No reclaim logic needed at all. If the transaction
   didn't commit, the occurrence was never marked fired, so the next
   scheduler tick just tries again. Durable, survives any pooling, and gives
   a free audit trail of what fired when.
@@ -348,8 +348,8 @@ alternative seen in prior art. Three approaches were compared directly:
   liveness is already recorded, so "is the old fleet still up?" is a question
   the database can answer; the refusal names the required order, in the
   deployment's own schema rather than the default one. What such a check can
-  prove must be stated exactly -- absence of a trace is not absence of a
-  process -- and the gap it leaves named as the drain window. Testing "from
+  prove must be stated exactly: absence of a trace is not absence of a
+  process. The gap it leaves is named as the drain window. Testing "from
   the previous release" therefore means starting at the previous migration and
   exercising the previous release's own statements across the transition, not
   starting at the new one.
@@ -357,7 +357,7 @@ alternative seen in prior art. Three approaches were compared directly:
   database that applied an earlier one in an earlier release never re-executes
   it, and a check inherited by comment holds only for a database installed
   from empty in a single `migrate`. Where a migration also strands rows the
-  running fleet owns, the check covers those as well -- and the liveness half
+  running fleet owns, the check covers those as well, and the liveness half
   of it reads the table written on a timer, not the one the migration is
   changing: a component idle between units of work leaves no trace in the
   latter.
@@ -365,7 +365,7 @@ alternative seen in prior art. Three approaches were compared directly:
   queue; a bounded purge reads work proportional to its limit rather than to
   the backlog behind it; and it delivers that limit when the rows exist. All
   three follow from bounding the delete by the age of the budget's last row,
-  inclusive of every row sharing that instant -- jobs finished in one
+  inclusive of every row sharing that instant. Jobs finished in one
   transaction share a `finished_at`, so a tie group routinely straddles the
   boundary. None of them follows from the order queues are visited in, since
   one queue can hold the oldest row and enough newer ones to exhaust the
@@ -391,8 +391,8 @@ alternative seen in prior art. Three approaches were compared directly:
   isolated in the storage implementation.
 - Support PostgreSQL roles with least privilege: API producers may enqueue and
   inspect only their allowed queues; workers may claim/transition their queues;
-  migration role owns DDL. A worker capability grants no `INSERT` on `jobs` --
-  claiming work and creating it are separate authorities, and a role that needs
+  migration role owns DDL. A worker capability grants no `INSERT` on `jobs`.
+  Claiming work and creating it are separate authorities, and a role that needs
   both asks for both capabilities.
 - Retention deletion is a capability of its own, and it is not a table-wide
   `DELETE`. The purge capability grants `EXECUTE` on a `SECURITY DEFINER`
@@ -400,7 +400,7 @@ alternative seen in prior art. Three approaches were compared directly:
   from its own arguments; the routine is the safety boundary, so a crafted call
   cannot reach a non-terminal job, another queue's jobs, or an unbounded batch.
   The package's own retention API goes through that routine and no other path,
-  so holding the capability is sufficient to run it -- a capability whose only
+  so holding the capability is sufficient to run it. A capability whose only
   caller is hand-written SQL is not one. The corollary is a breaking change to
   document, not to soften: a privilege alone no longer authorizes retention,
   so an operator identity that is neither the schema owner nor queue-granted
@@ -413,7 +413,7 @@ alternative seen in prior art. Three approaches were compared directly:
   refuse a role that owns the schema, the database, or an object in the
   schema: an owner re-grants itself anything the moment it is narrowed. "An
   object" means whatever catalog it lives in, not the handful a grant model
-  thinks about -- relations, routines, types, collations, conversions,
+  thinks about: relations, routines, types, collations, conversions,
   operators and their classes and families, text-search dictionaries and
   configurations, extended statistics, extensions. A check written catalog by
   catalog is a list that falls behind the server, so the ownership record
@@ -426,7 +426,7 @@ alternative seen in prior art. Three approaches were compared directly:
   grants is an exact fingerprint, and adding on one is safe because the roles
   it matches already hold the neighbouring privileges. Removing on one is not,
   because a privilege two capabilities both confer is indistinguishable, and
-  the capability set is the caller's -- never recorded, so never the
+  the capability set is the caller's. It is never recorded, so never the
   database's to infer. A change the fingerprint cannot repair is documented
   with its failure mode; one that leaves a component unable to work at all
   rather than degraded is repaired.
@@ -437,7 +437,7 @@ alternative seen in prior art. Three approaches were compared directly:
   capability set was applied first.
 - Narrowing a role means every privilege class, not the ones a grant model
   happens to use. Tables, routines, and sequences are separate classes, and
-  `REVOKE ... ON ALL TABLES` reaches none of the others -- an identity column
+  `REVOKE ... ON ALL TABLES` reaches none of the others. An identity column
   is a sequence object of its own, so a privilege on one outlives every repair
   that names only tables.
 - Role provisioning is responsible for the privileges that live outside the
@@ -456,8 +456,8 @@ alternative seen in prior art. Three approaches were compared directly:
   must honour it, and `role_queue_grants` itself, because every policy above is
   a subquery against it evaluated as the querying role, so under RLS it would
   filter itself and every policy would match nothing. Both leak the shape of
-  the deployment -- which queues exist, which are paused, which roles hold
-  what -- and neither is writable by a scoped role. `role_runtime_kinds`, which
+  the deployment (which queues exist, which are paused, which roles hold
+  what), and neither is writable by a scoped role. `role_runtime_kinds`, which
   records the kinds a role may claim liveness as, is outside it for the same
   reason as the second of those and carries no queue; it is not directly
   readable either, since the policies reach it through a `SECURITY DEFINER`
@@ -470,8 +470,8 @@ alternative seen in prior art. Three approaches were compared directly:
   a schedule, its queue must be tied to that reference by constraint, not
   merely written by the caller: a policy can only test the label, so a label
   the writer chooses is not a boundary. This matters wherever such a row also
-  carries a globally unique key -- an attempt number, a slot key, an occurrence
-  instant -- because forging the label consumes that key and denies service to
+  carries a globally unique key (an attempt number, a slot key, an occurrence
+  instant), because forging the label consumes that key and denies service to
   the queue that owns it.
 - Liveness is recorded per queue, so a component that serves several records
   one heartbeat per queue served, and an unfiltered liveness query counts each
@@ -495,7 +495,7 @@ For each, the complete state set, who may cause each transition, and what is
 ordered with respect to what. "Operator" means an `Admin` call or the CLI;
 "migration role" means the identity that runs DDL.
 
-**`concurrency_slots`** — a row *is* the lease on a named key.
+**`concurrency_slots`**: a row *is* the lease on a named key.
 
 | State | Meaning |
 | --- | --- |
@@ -522,7 +522,7 @@ ordered with respect to what. "Operator" means an `Admin` call or the CLI;
   finalize transaction, so a job is never leased without its slot and never
   holds a slot after its attempt is durable.
 
-**`runtime_heartbeats`** — one row per `(kind, instance, queue, role)`.
+**`runtime_heartbeats`**: one row per `(kind, instance, queue, role)`.
 
 | State | Meaning |
 | --- | --- |
@@ -541,7 +541,7 @@ ordered with respect to what. "Operator" means an `Admin` call or the CLI;
   nothing to retract.
 - A policy must not depend on a grant that only provisioning can make. A policy
   expression is evaluated as the querying role, so a table a policy reads is a
-  table every role it governs must hold `SELECT` on -- and a migration cannot
+  table every role it governs must hold `SELECT` on, and a migration cannot
   grant that to roles that already exist. A table introduced alongside the
   policy that reads it is therefore reached through a `SECURITY DEFINER`
   function, not directly.
@@ -558,13 +558,13 @@ ordered with respect to what. "Operator" means an `Admin` call or the CLI;
   unconditionally would fail every tick of every deployment, including the ones
   with nothing to do. When it is needed and refused, the claim is left to go
   stale rather than the tick to fail.
-- Time: fresh → stale. This is the answer for a process that *died* — it cannot
+- Time: fresh → stale. This is the answer for a process that *died*. It cannot
   retract anything, so time must. It is not the answer for a running process
   whose responsibilities changed; that one says so itself.
 - No component writes another's row, and no operator writes any of them. This
   is enforced, not merely intended: the row records the role that wrote it and
   a role may only write, refresh or retract its own. Queue scope alone cannot
-  say it -- on a queue a worker and a scheduler share, it lets either write the
+  say it. On a queue a worker and a scheduler share, it lets either write the
   other's row.
 - A role may only claim a `kind` its capabilities entitle it to, recorded at
   provisioning time. Ownership alone leaves the other half open: a worker role
@@ -573,7 +573,7 @@ ordered with respect to what. "Operator" means an `Admin` call or the CLI;
 - Ordering within a tick: the upserts commit with the retraction, so a probe
   never sees a served queue without its heartbeat.
 
-**`schedules`** — declared in code, synced to the database.
+**`schedules`**: declared in code, synced to the database.
 
 | State | Meaning |
 | --- | --- |
@@ -586,7 +586,7 @@ ordered with respect to what. "Operator" means an `Admin` call or the CLI;
 - Disabling is not deleting: occurrences already fired stay, and re-enabling
   does not re-fire them.
 
-**`schedule_occurrences`** — one row per `(schedule_id, occurrence_at)`, and
+**`schedule_occurrences`**: one row per `(schedule_id, occurrence_at)`, and
 the exactly-once guarantee for scheduling.
 
 | State | Meaning |
@@ -602,7 +602,7 @@ the exactly-once guarantee for scheduling.
 - The key is not queue-scoped: a schedule moved between queues must not fire
   its history again.
 
-**`queue_pauses`** — admission control, not lifecycle.
+**`queue_pauses`**: admission control, not lifecycle.
 
 | State | Meaning |
 | --- | --- |
@@ -615,12 +615,12 @@ the exactly-once guarantee for scheduling.
 - The gate is in the claim SQL, so it binds every worker whatever a `Worker`
   believes. It never touches a job already leased.
 
-**`role_queue_grants`** — the data the policies read.
+**`role_queue_grants`**: the data the policies read.
 
 - Migration role only. A scoped role holds `SELECT` and nothing else, which is
   what stops it granting itself a queue.
 
-**`role_runtime_kinds`** — which component kinds a role may claim liveness as.
+**`role_runtime_kinds`**: which component kinds a role may claim liveness as.
 
 | State | Meaning |
 | --- | --- |
@@ -630,11 +630,11 @@ the exactly-once guarantee for scheduling.
 | both | it holds both capabilities, and may claim either |
 
 - `provision_role` only. Not an operator, not a runtime component, and not the
-  component whose kind it describes -- a role that could write this table could
+  component whose kind it describes. A role that could write this table could
   authorize its own liveness claims, which is the whole thing the table is for.
 - Replaced on every provisioning call, not merged into: the rows are deleted
   and re-inserted from the capability set in that call. So narrowing a role
-  takes its kinds with it -- re-provisioning a `CONSUME`-and-`SCHEDULE` role
+  takes its kinds with it. Re-provisioning a `CONSUME`-and-`SCHEDULE` role
   with `CONSUME` alone leaves it `worker`, and with neither (`INSPECT`,
   `PRODUCE`, `PURGE`) leaves it no rows and no ability to heartbeat.
 - `revoke_role` deletes them, like the queue grants.
@@ -648,7 +648,7 @@ the exactly-once guarantee for scheduling.
   which is a reason to narrow a role by re-provisioning it rather than by
   revoking privileges directly.
 
-**Retention** — the only path by which a durable job row disappears.
+**Retention**: the only path by which a durable job row disappears.
 
 - Operator only, through `purge_terminal_jobs`, and only for jobs in a terminal
   state older than the cutoff. A live job is never a candidate.
@@ -659,10 +659,10 @@ the exactly-once guarantee for scheduling.
 
 **Revised:** the original §8 bullet described the role model only in terms of
 who may enqueue, claim, and run DDL. Auditing the first consuming application
-showed that leaves three real gaps -- a worker role that could enqueue, a
+showed that leaves three real gaps: a worker role that could enqueue, a
 purger that could only be expressed as a raw `DELETE` grant, and a "repaired"
-role that kept `SUPERUSER` or `BYPASSRLS` through provisioning -- so the
-bullets above are added rather than reworded. Breaking the capability grants
+role that kept `SUPERUSER` or `BYPASSRLS` through provisioning. The
+bullets above are therefore added rather than reworded. Breaking the capability grants
 was accepted: a least-privilege model that has to be widened by hand at every
 call site is not one.
 
@@ -688,7 +688,7 @@ against real PostgreSQL must prove:
    dedupe key.
 4. Multiple workers process a job at most once per successful lease attempt.
 5. A worker crash during a handler causes bounded retry after lease expiry;
-   the stale worker cannot complete the newer attempt — this is the fencing
+   the stale worker cannot complete the newer attempt. This is the fencing
    guarantee from §3 and needs a test that actually holds a lease past
    expiry and attempts to write with the stale token, not just a timing test.
 6. Retry, timeout, cancellation, and terminal failure state transitions are
@@ -697,16 +697,16 @@ against real PostgreSQL must prove:
    delay work at most; none loses work.
 8. Periodic schedules fire once per occurrence across multiple schedulers,
    including a scheduler crash between claiming an occurrence and enqueueing
-   its job (§6) — the occurrence must not be lost or double-fired.
+   its job (§6). The occurrence must not be lost or double-fired.
 9. Blocking handlers cannot starve unrelated jobs beyond their configured
-   worker concurrency — verify the default-executor bound from §4 actually
+   worker concurrency. Verify the default-executor bound from §4 actually
    caps concurrent `asyncio.to_thread` work, not just async task concurrency.
 10. Migration, upgrade, retention cleanup, and least-privilege role tests pass.
 
 ## 11. Development workflow
 
 **New section.** picv-2025 (the initial consuming application) already has a
-working pattern for exactly this — mirror it rather than inventing a new one.
+working pattern for exactly this. Mirror it rather than inventing a new one.
 
 - **PostgreSQL is managed by `mise`, not Docker.** picv-2025's `mise.toml`
   runs a project-local cluster directly (`mise x postgres -- pg_ctl -D
@@ -720,32 +720,32 @@ working pattern for exactly this — mirror it rather than inventing a new one.
   `pytest -m integration`, then drops both. Mirror this for `rqueue`: a
   `scripts/integration.sh` (or equivalent `mise` task) that creates a fresh
   database, runs `rqueue`'s own migrations, runs the integration suite, and
-  tears down — never against a shared or production-shaped database.
+  tears down, never against a shared or production-shaped database.
 - **Fast tests stay database-free**; integration tests are marked
   (`pytest.mark.integration`) and excluded from the default `mise run test`
   the same way picv-2025 splits `test` from `test-integration`.
 - **A master pipeline test, runnable in a loop during development.** One
   integration test that exercises the full lifecycle end to end in a single
-  run — transactional enqueue and rollback, claim, heartbeat, successful
+  run: transactional enqueue and rollback, claim, heartbeat, successful
   completion, a forced retry, a dedupe_key conflict, a named-concurrency-key
   conflict, a lease-expiry-then-fencing-rejection sequence, and one periodic
-  occurrence firing — asserting on durable state after each step rather than
+  occurrence firing. It asserts on durable state after each step rather than
   mocking any of it. This is the outer-loop feedback signal during
   development: run it after every change to the claim/lease/scheduler code
   to see pass/fail across the whole pipeline in one shot, instead of only
   learning about a regression in claiming from a scheduler test failure
   later. It supplements, not replaces, the focused acceptance-criteria tests
-  in §10 — those stay granular so a failure points at one mechanism.
+  in §10. Those stay granular so a failure points at one mechanism.
 
 **Revised (2026-09-02):** neither this section nor §9 said anything about
 *consumer*-side testing, and every comparable library ships something for it
 (`procrastinate.testing.InMemoryConnector`, `PgQueuer.in_memory()`,
-`Oban.Testing`) — so a consumer such as picv-2025 had no way to unit-test
+`Oban.Testing`), so a consumer such as picv-2025 had no way to unit-test
 "does my code enqueue the right job" short of a real PostgreSQL round trip or
 a hand-rolled fake that proves nothing about the call's shape. Added
 `rqueue.testing.RecordingQueue`: it routes every call through the real,
 database-free `Queue.build_insert` and records the validated request instead
-of writing it. It is explicitly **non-durable and non-simulating** — it proves
+of writing it. It is explicitly **non-durable and non-simulating**. It proves
 a call is well-formed and would be accepted, and models no transactionality,
 dedupe resolution, claiming, or execution; those stay the job of the §10
 integration suite. It lives outside `rqueue/__init__.py`'s exports, following
