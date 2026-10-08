@@ -1,4 +1,4 @@
-"""The bounded default executor that caps asyncio.to_thread work (§4)."""
+"""The bounded default executor that caps asyncio.to_thread work."""
 
 from __future__ import annotations
 

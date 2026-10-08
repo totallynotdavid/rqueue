@@ -1,4 +1,4 @@
-"""§10.7: a lost notification or a restart delays work; it never loses work."""
+"""A lost notification or a restart delays work; it never loses work."""
 
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ from datetime import UTC
 import asyncpg
 import pytest
 
-from rqueue import Job, Queue, TaskContext, Worker
+from rqueue import Job, Queue, TaskContext, Worker, migrations
 from rqueue.models import JobState
 
 from .support import eventually, running
@@ -181,6 +181,52 @@ async def test_a_worker_restart_finishes_the_work(
     assert completions == [2]
 
 
+async def test_a_worker_started_on_a_schema_that_is_behind_recovers(
+    admin_dsn: str, pool: asyncpg.Pool, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A missing table is not a missing privilege, so the worker keeps retrying.
+
+    The schema is at 0001, which has `jobs` but not `runtime_heartbeats`, so the
+    first tick fails with a missing table. That is what a deploy that outruns
+    `rqueue migrate` produces. The worker logs that it cannot reach the database
+    and stays up, and it claims the first job once the migration lands.
+    """
+    schema = f"early_{uuid.uuid4().hex[:8]}"
+    queue = Queue(pool, name="early", schema=schema)
+    done = asyncio.Event()
+
+    async def work(payload: object, context: TaskContext) -> None:
+        done.set()
+
+    queue.register(name="work", handler=work)
+    worker = Worker(queue, worker_id="early", poll_interval=0.05, concurrency=1)
+    connection = await asyncpg.connect(admin_dsn)
+    await migrations.migrate(connection, schema=schema, target=1)
+    task = asyncio.create_task(worker.run())
+    try:
+        with caplog.at_level("WARNING"):
+            await worker.wait_started()
+            await eventually(
+                lambda: _logged(caplog, "could not reach PostgreSQL"),
+                message="the worker should log that it is retrying",
+            )
+        assert not task.done()
+
+        await migrations.migrate(connection, schema=schema)
+        async with connection.transaction():
+            await queue.enqueue(connection, task="work")
+        await asyncio.wait_for(done.wait(), timeout=15)
+    finally:
+        worker.stop()
+        await asyncio.wait_for(task, timeout=30)
+        await connection.execute(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
+        await connection.close()
+
+
+async def _logged(caplog: pytest.LogCaptureFixture, text: str) -> bool:
+    return any(text in record.getMessage() for record in caplog.records)
+
+
 async def test_wait_shutdown_waits_for_a_blocking_thread(
     queue: Queue, pool: asyncpg.Pool
 ) -> None:
@@ -206,7 +252,6 @@ async def test_wait_shutdown_waits_for_a_blocking_thread(
         poll_interval=0.05,
         concurrency=1,
         shutdown_timeout=0.05,
-        executor_shutdown="wait",
     )
     run_task = asyncio.create_task(worker.run())
     await worker.wait_started()
@@ -227,54 +272,6 @@ async def test_wait_shutdown_waits_for_a_blocking_thread(
     assert handed_back is not None
     assert handed_back.state == JobState.PENDING
     assert handed_back.error_type == "WorkerShutdown"
-
-
-async def test_detach_shutdown_returns_and_hands_back_before_thread_finishes(
-    queue: Queue, pool: asyncpg.Pool
-) -> None:
-    started = asyncio.Event()
-    release = threading.Event()
-    finished = threading.Event()
-
-    def blocking_work() -> None:
-        release.wait()
-        finished.set()
-
-    async def work(payload: object, context: TaskContext) -> None:
-        started.set()
-        await asyncio.to_thread(blocking_work)
-
-    queue.register(name="work", handler=work)
-    async with pool.acquire() as connection, connection.transaction():
-        job = await queue.enqueue(connection, task="work")
-
-    worker = Worker(
-        queue,
-        worker_id="detach-shutdown",
-        poll_interval=0.05,
-        concurrency=1,
-        shutdown_timeout=0.05,
-        executor_shutdown="detach",
-    )
-    run_task = asyncio.create_task(worker.run())
-    await worker.wait_started()
-    await asyncio.wait_for(started.wait(), timeout=15)
-
-    shutdown_started = time.monotonic()
-    try:
-        await worker.shutdown(timeout=0.05)
-        elapsed = time.monotonic() - shutdown_started
-        assert elapsed < 2
-        assert not finished.is_set()
-
-        handed_back = await queue.get_job(job.id)
-        assert handed_back is not None
-        assert handed_back.state == JobState.PENDING
-        assert handed_back.error_type == "WorkerShutdown"
-    finally:
-        release.set()
-        await asyncio.wait_for(asyncio.to_thread(finished.wait), timeout=15)
-        await asyncio.wait_for(run_task, timeout=15)
 
 
 async def test_hard_cancellation_hands_claimed_work_to_a_successor(

@@ -1,4 +1,4 @@
-"""The bounded default executor the Worker installs (docs/requirements.md §4).
+"""The bounded default executor the Worker installs.
 
 Handlers are async only. Blocking work goes through ``asyncio.to_thread``,
 which submits to the running loop's *default* executor -- and the default
@@ -12,7 +12,7 @@ author constructing an executor of their own.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable, Iterator
+from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 
@@ -24,17 +24,13 @@ def bounded_default_executor(
     max_workers: int,
     *,
     thread_name_prefix: str = "rqueue",
-    wait_for_blocking_threads: bool | Callable[[], bool] = True,
 ) -> Iterator[ThreadPoolExecutor]:
     """Install a bounded default executor for the running loop, then restore.
 
     The previous default executor is put back on exit, so embedding a Worker in
     a larger application does not permanently reshape that application's loop.
-
-    ``wait_for_blocking_threads`` may be a callback because a Worker can select
-    its shutdown policy after this context has been entered. With ``False``,
-    queued work is cancelled and running threads are left for the process
-    supervisor to terminate; Python cannot safely interrupt those threads.
+    Exit waits for running threads: Python cannot safely interrupt a thread, so
+    the only way to be rid of one is to let it return.
     """
     loop = asyncio.get_running_loop()
     previous = getattr(loop, "_default_executor", None)
@@ -53,9 +49,4 @@ def bounded_default_executor(
             loop.set_default_executor(previous)
         else:
             loop._default_executor = previous  # type: ignore[attr-defined]
-        wait = (
-            wait_for_blocking_threads()
-            if callable(wait_for_blocking_threads)
-            else wait_for_blocking_threads
-        )
-        executor.shutdown(wait=wait, cancel_futures=not wait)
+        executor.shutdown(wait=True)

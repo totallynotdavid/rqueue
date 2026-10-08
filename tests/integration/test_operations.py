@@ -1,4 +1,4 @@
-"""§10.10: migration, upgrade, retention cleanup, and least-privilege roles."""
+"""Migration, upgrade, retention cleanup, and least-privilege roles."""
 
 from __future__ import annotations
 
@@ -210,7 +210,7 @@ async def seed_for_upgrade(
 async def test_upgrading_from_any_shipped_version_matches_a_fresh_install(
     admin_dsn: str, start: int
 ) -> None:
-    """§7: migrations are tested from empty *and* from what is already out there.
+    """Migrations are tested from empty *and* from what is already out there.
 
     Every version, not `latest - 1`. A release that ships one migration makes
     those the same thing, and this test used to say so -- which held right up
@@ -261,7 +261,7 @@ async def test_upgrading_from_any_shipped_version_matches_a_fresh_install(
 async def test_a_failing_migration_leaves_no_partial_schema(
     scratch_schema: tuple[asyncpg.Connection, str],
 ) -> None:
-    """§7: transactional where PostgreSQL permits, which for DDL is everywhere."""
+    """Migrations are transactional, which PostgreSQL permits for all DDL."""
     connection, schema = scratch_schema
     await connection.execute(f"CREATE SCHEMA {schema}")
     await connection.execute(f"CREATE TABLE {schema}.jobs (id int)")
@@ -749,7 +749,7 @@ def produce_only_pool(
 
 
 async def test_a_produce_only_role_can_enqueue(admin_dsn: str, queue_name: str) -> None:
-    """§10.10: PRODUCE alone has to be enough to enqueue, both insert paths.
+    """PRODUCE alone has to be enough to enqueue, both insert paths.
 
     Every enqueue is an ``INSERT ... ON CONFLICT ... DO UPDATE SET updated_at``
     (see :meth:`rqueue.storage.Storage.insert_job`), and PostgreSQL demands
@@ -835,7 +835,7 @@ async def test_a_produce_only_role_cannot_rewrite_a_job(
 async def test_a_consume_only_role_cannot_enqueue(
     admin_dsn: str, pool: asyncpg.Pool, queue_name: str
 ) -> None:
-    """§8: a worker claims and transitions work; it does not create work.
+    """A worker claims and transitions work; it does not create work.
 
     The grant shape is asserted without a database in ``tests/test_roles.py``;
     this is the half that proves PostgreSQL agrees, because a stray
@@ -1299,8 +1299,8 @@ async def test_0011_repairs_a_scheduler_that_would_otherwise_enqueue_nothing(
     `provision_role` runs again. This release adds `UPDATE (updated_at)` on
     `jobs` to SCHEDULE -- every enqueue is an `ON CONFLICT ... DO UPDATE SET
     updated_at`, and PostgreSQL wants UPDATE on every column that names -- so
-    an un-reprovisioned scheduler does not degrade, it enqueues nothing, and
-    `Scheduler.run` reports the privilege error as a connectivity problem.
+    an un-reprovisioned scheduler cannot enqueue, and `Scheduler.run` stops
+    with the privilege error.
 
     0011 repairs it on a fingerprint that is exact in one direction: only
     SCHEDULE grants INSERT on `schedules`, and a role it matches already holds
@@ -1371,6 +1371,71 @@ async def test_0011_repairs_a_scheduler_that_would_otherwise_enqueue_nothing(
             await connection.execute(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
         finally:
             await connection.close()
+
+
+async def test_a_scheduler_missing_a_privilege_stops_with_a_permission_error(
+    admin_dsn: str, pool: asyncpg.Pool, queue_name: str
+) -> None:
+    """A refused statement is the same on every tick, so retrying hides it.
+
+    The role is provisioned in full and then loses `UPDATE (updated_at)` on
+    `jobs`, which is what a scheduler provisioned before 0011 lacks. Its first
+    firing is refused by PostgreSQL, and `run` has to say so and stop.
+    """
+    async with scoped_role_pool(
+        admin_dsn,
+        capabilities=[Capability.SCHEDULE],
+        queues=[queue_name],
+        prefix="rq_stale_sched",
+    ) as scoped:
+        role = await scoped.fetchval("SELECT current_user")
+        async with pool.acquire() as connection:
+            await connection.execute(
+                f"REVOKE UPDATE (updated_at) ON task_queue.jobs FROM {role}"
+            )
+
+        scheduler = Scheduler(
+            Queue(scoped, name=queue_name),
+            scheduler_id="stale-scheduler",
+            interval=0.05,
+            schedules=[
+                ScheduleSpec(
+                    name=f"every-minute-{queue_name}", task="work", cron="* * * * *"
+                )
+            ],
+        )
+        (stored,) = await scheduler.sync()
+        async with pool.acquire() as connection:
+            await connection.execute(
+                "UPDATE task_queue.schedules "
+                "SET created_at = created_at - interval '1 hour' WHERE id = $1",
+                stored.id,
+            )
+
+        with pytest.raises(ConfigurationError, match="privilege"):
+            await asyncio.wait_for(scheduler.run(), timeout=15)
+
+
+async def test_a_worker_missing_a_privilege_stops_with_a_permission_error(
+    admin_dsn: str, queue_name: str
+) -> None:
+    """The same rule for a worker: a role without CONSUME cannot tick."""
+    async with scoped_role_pool(
+        admin_dsn,
+        capabilities=[Capability.PRODUCE],
+        queues=[queue_name],
+        prefix="rq_stale_worker",
+    ) as scoped:
+        queue = Queue(scoped, name=queue_name)
+
+        async def handler(payload: object, context: TaskContext) -> None:
+            return None
+
+        queue.register(name="work", handler=handler)
+        worker = Worker(queue, worker_id="no-consume", poll_interval=0.05)
+
+        with pytest.raises(ConfigurationError, match="privilege"):
+            await asyncio.wait_for(worker.run(), timeout=15)
 
 
 async def test_a_live_concurrency_slot_belongs_to_the_worker_holding_it(
@@ -1961,7 +2026,7 @@ async def test_provisioning_strips_sequence_privileges_too(admin_dsn: str) -> No
 
 
 async def test_provisioning_strips_a_role_back_down(admin_dsn: str) -> None:
-    """§8: repair covers what lives outside the schema's grant tables.
+    """Repair covers what lives outside the schema's grant tables.
 
     A role someone made SUPERUSER or BYPASSRLS ignores every policy and grant
     below it, so a ``provision_role`` that fixed only the table grants would
@@ -2251,7 +2316,7 @@ async def test_schedules_are_queue_scoped(
 async def test_schedule_occurrences_are_queue_scoped(
     admin_dsn: str, pool: asyncpg.Pool, queue_name: str
 ) -> None:
-    """An occurrence row is what makes a firing exactly-once (§6).
+    """An occurrence row is what makes a firing exactly-once.
 
     Forging one for a foreign schedule is not a leak but a denial of service:
     that schedule never fires that occurrence again. Foreign-key checks run as
@@ -2384,7 +2449,7 @@ async def test_one_instance_id_can_beat_on_two_queues(
 async def test_a_schedule_only_role_can_fire_a_schedule(
     admin_dsn: str, pool: asyncpg.Pool, queue_name: str
 ) -> None:
-    """§8: SCHEDULE has to be enough to run the scheduler, end to end.
+    """SCHEDULE has to be enough to run the scheduler, end to end.
 
     Existing coverage runs the scheduler as the schema owner, which hides
     every gap in this capability's grants -- firing is an enqueue, and an
@@ -2983,7 +3048,7 @@ async def test_a_global_liveness_probe_counts_one_process_once(
 
 
 async def test_migrating_a_schedule_that_changed_queues(admin_dsn: str) -> None:
-    """§7: migrations are tested against what a real database can hold.
+    """Migrations are tested against what a real database can hold.
 
     A schedule moved between queues before 0005 leaves occurrences whose jobs
     are on the old queue while the schedule is on the new one. The backfill has
@@ -3432,7 +3497,7 @@ async def test_provisioning_refuses_a_role_that_owns_the_queue_tables(
 async def test_a_purge_only_role_can_purge_through_admin(
     admin_dsn: str, pool: asyncpg.Pool, queue_name: str
 ) -> None:
-    """§8: PURGE has to be enough to run the documented retention API.
+    """PURGE has to be enough to run the documented retention API.
 
     A capability whose only caller is raw SQL is not a capability. `Admin`
     holds no DELETE on `jobs` when it runs as this role, so this passes only
@@ -3499,7 +3564,7 @@ async def test_a_purge_only_role_can_purge_through_admin(
 async def test_a_schedule_that_moves_queues_does_not_refire_its_history(
     admin_dsn: str, pool: asyncpg.Pool, queue_name: str
 ) -> None:
-    """§6: one occurrence per (schedule, instant), on whichever queue.
+    """One occurrence per (schedule, instant), on whichever queue.
 
     A scheduler reads `last_occurrence` to bound catch-up. If the rows written
     before a queue move were invisible to it, that history would read as empty
@@ -3696,7 +3761,7 @@ async def seed_finished(
 async def test_a_bounded_purge_deletes_the_oldest_jobs_first(
     pool: asyncpg.Pool, purge_schema: str
 ) -> None:
-    """§7 retention is oldest-first, across queues as well as within one.
+    """Retention is oldest-first, across queues as well as within one.
 
     A single DELETE ordered by finished_at gave that for free. It is the case
     below that a fan-out gets wrong: one queue holding both the oldest row in
@@ -3932,7 +3997,7 @@ async def test_a_purge_cutoff_is_judged_by_the_database_clock(
 async def test_provisioning_revokes_a_membership_someone_else_granted(
     admin_dsn: str,
 ) -> None:
-    """§8: a repaired role must not keep privileges through a group.
+    """A repaired role must not keep privileges through a group.
 
     Since PostgreSQL 16 one membership can be granted several times by
     different roles, and a bare `REVOKE role FROM member` removes only the
