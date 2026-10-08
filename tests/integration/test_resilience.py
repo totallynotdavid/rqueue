@@ -451,8 +451,13 @@ async def test_a_real_database_restart_delays_work_but_loses_none(
     queue: Queue, pool: asyncpg.Pool
 ) -> None:
     """A postmaster outage only delays work queued on either side of it."""
-    if not os.environ.get("RQUEUE_LOCAL_DATABASE_OWNER"):
+    cluster_dir = os.environ.get("RQUEUE_LOCAL_CLUSTER_DIR")
+    port = os.environ.get("RQUEUE_LOCAL_CLUSTER_PORT")
+    if not cluster_dir or not port:
         pytest.skip("the integration suite does not own this PostgreSQL cluster")
+    cluster = os.path.join(
+        os.path.dirname(__file__), "..", "..", "scripts", "cluster.sh"
+    )
 
     processed: list[str] = []
 
@@ -466,23 +471,22 @@ async def test_a_real_database_restart_delays_work_but_loses_none(
         )
 
     worker = Worker(queue, worker_id="postmaster-survivor", poll_interval=0.1)
-    repo_root = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
     try:
         async with running(worker):
-            # The serial integration run shares this cluster with other tests.
+            # This run owns the cluster, so stopping it cannot reach another
+            # run's database.
             await asyncio.to_thread(
                 subprocess.run,
-                ["mise", "run", "db:stop"],
-                cwd=repo_root,
+                ["bash", cluster, "stop", cluster_dir],
                 check=True,
                 timeout=60,
             )
             await asyncio.to_thread(
                 subprocess.run,
-                ["mise", "run", "db:start"],
-                cwd=repo_root,
+                ["bash", cluster, "start", cluster_dir, port],
                 check=True,
                 timeout=120,
+                stdout=subprocess.DEVNULL,
             )
 
             after = await _enqueue_with_retry(queue, pool, {"tag": "after"})
@@ -497,13 +501,13 @@ async def test_a_real_database_restart_delays_work_but_loses_none(
                 message="the job queued after reconnection must still run",
             )
     finally:
-        # The following test needs the project-local cluster even if this test fails.
+        # Later tests need the cluster even if this test fails.
         await asyncio.to_thread(
             subprocess.run,
-            ["mise", "run", "db:start"],
-            cwd=repo_root,
+            ["bash", cluster, "start", cluster_dir, port],
             check=True,
             timeout=120,
+            stdout=subprocess.DEVNULL,
         )
 
     assert sorted(processed) == ["after", "before"]

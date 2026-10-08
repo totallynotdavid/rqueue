@@ -712,8 +712,8 @@ working pattern for exactly this. Mirror it rather than inventing a new one.
 
 - **PostgreSQL is managed by `mise`, not Docker.** picv-2025's `mise.toml`
   runs a project-local cluster directly (`mise x postgres -- pg_ctl -D
-  $PWD/.data/postgres ...`), with `db:init`/`db:start`/`db:stop`/`db:reset`
-  tasks. Reuse this exact structure so a contributor working across both
+  $PWD/.data/postgres ...`), with `db:start`/`db:stop`/`db:reset` tasks
+  (`db:start` initializes the cluster). Reuse this exact structure so a contributor working across both
   repos has one mental model, not two.
 - **Integration tests run against a disposable, per-run database and a
   least-privilege role.** picv-2025's `scripts/integration.sh` creates
