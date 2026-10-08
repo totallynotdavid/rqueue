@@ -38,8 +38,9 @@ controls admission. `Worker.stop()` and `Worker.drain()` control one worker, and
 `resume_queue("*")` resumes every queue, including queues paused by name.
 Resuming one queue by name does not lift a wildcard pause.
 
-`"*"` means every queue for pause, resume and role grants. `Admin.purge` does
-not accept it: omit `queue` there. No queue can be named `"*"`.
+`"*"` means every queue wherever a queue is named: pause, resume, role grants,
+`Admin.purge`, `Admin.stats`, and the `queue` filter of `Admin.list_jobs`. No
+queue can be named `"*"`.
 
 `Admin.paused_queues()` lists the paused queues and when each was paused.
 `Admin.is_queue_paused(name)` answers for one queue, wildcard included.

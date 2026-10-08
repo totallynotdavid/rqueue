@@ -5,7 +5,7 @@
 ```console
 $ rqueue status                     # applied and pending migrations, as JSON
 $ rqueue readiness --queue compute  # connectivity, schema, worker, scheduler
-$ rqueue purge --retention-days 30  # delete old terminal jobs
+$ rqueue purge --queue '*' --retention-days 30  # delete old terminal jobs
 $ rqueue grant-role --role api --capability produce --queue compute
 ```
 
@@ -19,7 +19,7 @@ and `-v` for debug logging. Pass them before the command name:
 | `migrate`    | `--target N`                                                                                               | 0, or 1 on an error           |
 | `status`     | none                                                                                                       | 1 when migrations are pending |
 | `readiness`  | `--queue`, `--require-scheduler`, `--no-require-worker`                                                    | 1 when not ready              |
-| `purge`      | `--retention-days` (required), `--queue`, `--limit` (default 10000)                                        | 0, or 1 on an error           |
+| `purge`      | `--queue` (required, `*` for every queue), `--retention-days` (required), `--limit` (default 10000)        | 0, or 1 on an error           |
 | `grant-role` | `--role`, `--capability` (repeat), `--queue` (repeat, default `*`), `--password` or `RQUEUE_ROLE_PASSWORD` | 0, or 1 on an error           |
 
 `--capability` takes `produce`, `consume`, `schedule`, `inspect`, or `purge`.
@@ -40,6 +40,9 @@ Without a database URL the command exits with status 2. See
 | `purge(queue, retention, states, limit)`                                    | see [Roles](roles.md#purge)                     |
 | `pause_queue`, `resume_queue`, `paused_queues`, `is_queue_paused`           | see [Pausing](pausing.md)                       |
 | `list_schedules`, `get_schedule`, `set_schedule_enabled`, `delete_schedule` | see [Schedules](scheduling.md#manage-schedules) |
+
+Wherever a method or option names a queue, `"*"` means every queue. `purge`
+needs the queue written out: `None` raises, so only `"*"` purges everything.
 
 `retry_job` keeps the attempt counter and adds `additional_attempts` (default 1)
 to `max_attempts`. Attempt records are never rewritten, so a reset would collide
