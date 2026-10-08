@@ -30,7 +30,7 @@ class JobState(enum.StrEnum):
 
     ``PENDING`` and ``LEASED`` are active; the rest are terminal. A terminal
     job only becomes runnable again through the explicit operator retry
-    operation in :mod:`rqueue.admin` (§3).
+    operation in :mod:`rqueue.admin`.
     """
 
     PENDING = "pending"
@@ -126,7 +126,7 @@ class Job:
 
 @dataclass(frozen=True, slots=True)
 class Attempt:
-    """One immutable attempt record (§7)."""
+    """One immutable attempt record."""
 
     id: int
     job_id: uuid.UUID
@@ -158,7 +158,7 @@ class Attempt:
 
 @dataclass(frozen=True, slots=True)
 class Schedule:
-    """A periodic schedule row (§6)."""
+    """A periodic schedule row."""
 
     id: uuid.UUID
     name: str
@@ -242,7 +242,7 @@ class QueuePause:
 
 @dataclass(frozen=True, slots=True)
 class QueueStats:
-    """A point-in-time snapshot of one queue, for metrics and readiness (§7)."""
+    """A point-in-time snapshot of one queue, for metrics and readiness."""
 
     queue: str
     pending: int

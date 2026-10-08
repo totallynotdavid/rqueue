@@ -1,7 +1,7 @@
-"""What a handler is given (docs/requirements.md §4).
+"""What a handler is given.
 
 :class:`TaskContext` exposes job identity, the attempt number, a lease-aware
-heartbeat, a logger with structured fields, cooperative cancellation state, and
+heartbeat, a logger with structured fields, the cancellation request, and
 the :meth:`TaskContext.will_retry` decision hook. There is no connection, no
 SQL, and no way to move the job between states from inside a handler; outcomes
 are expressed by returning or by raising one of the signals in
@@ -83,8 +83,11 @@ class TaskContext:
     def cancel_requested(self) -> bool:
         """Whether someone has asked this job to stop.
 
-        Cancellation is cooperative (§5): a handler that ignores this keeps
-        running until its lease expires or it finishes on its own.
+        The worker learns of a request on its next heartbeat, cancels the
+        handler task, and finalizes the job as cancelled. A handler that
+        catches :class:`asyncio.CancelledError` and returns normally finishes
+        the job as succeeded instead. This property is for code that wants to
+        stop cleanly before the cancellation arrives.
         """
         return self._cancel_event.is_set()
 

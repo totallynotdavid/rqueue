@@ -1,4 +1,4 @@
-"""Resource bounds and the validators that enforce them (docs/requirements.md §8).
+"""Resource bounds and the validators that enforce them.
 
 A bound on a persisted column is mirrored as a CHECK constraint in the
 migrations, so a direct SQL writer cannot get past it either. Bounds on
@@ -181,7 +181,7 @@ def encode_json(
     """Serialize a JSON-only value, rejecting anything unserializable.
 
     ``json.dumps`` with the default encoder is what makes "payloads are JSON
-    only" (§3) true: a callable, a pickle, or an arbitrary object raises here
+    only" true: a callable, a pickle, or an arbitrary object raises here
     rather than reaching the database.
     """
     if require_object and not isinstance(value, Mapping):

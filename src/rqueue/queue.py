@@ -47,8 +47,8 @@ if TYPE_CHECKING:
 
 __all__ = ["ConflictMode", "Queue"]
 
-#: What to do when a dedupe key is already held by an active job. §3 requires
-#: the choice to be explicit per call, so there is no default.
+#: What to do when a dedupe key is already held by an active job. The choice
+#: is explicit per call, so there is no default.
 ConflictMode = Literal["return_existing", "raise"]
 
 
@@ -65,7 +65,7 @@ class Queue:
 
     The pool is only used for inspection and administration. Enqueueing always
     takes a caller-supplied connection so the job lands in the caller's own
-    transaction (§3):
+    transaction:
 
     >>> async with pool.acquire() as connection:          # doctest: +SKIP
     ...     async with connection.transaction():
@@ -78,8 +78,8 @@ class Queue:
     ...             on_conflict="return_existing",
     ...         )
 
-    Business code should not import rqueue to do this. Pass a thin callback,
-    the way picv-2025's ``repository.create_or_get_job(..., defer=...)`` does::
+    Business code should not import rqueue to do this. Pass it a thin callback,
+    for example as the ``defer`` argument of a repository function::
 
         async def enqueue_simulation(connection, compute_job_id):
             return await queue.enqueue(

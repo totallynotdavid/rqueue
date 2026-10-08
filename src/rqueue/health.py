@@ -1,4 +1,4 @@
-"""Readiness checks that distinguish their failure modes (§7).
+"""Readiness checks that distinguish their failure modes.
 
 A single "ready: false" is useless during an incident. This reports
 PostgreSQL connectivity, migration version, worker availability, and scheduler

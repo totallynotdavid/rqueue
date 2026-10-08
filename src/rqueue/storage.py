@@ -1,4 +1,4 @@
-"""The only module that reads or writes job and schedule rows (docs/requirements.md §8).
+"""The only module that reads or writes job and schedule rows.
 
 Every statement here is a module-level constant built once from a fixed tuple
 of column names and a schema identifier that has been through
@@ -179,8 +179,7 @@ class Storage:
         The dedupe collision path is an ``ON CONFLICT ... DO UPDATE`` that
         writes nothing, rather than ``DO NOTHING``. ``DO NOTHING`` does not
         wait on a concurrent inserter, so a racing producer would get neither
-        an insert nor a row to return -- exactly the "skip mode drops silently"
-        problem §1 calls out in pgqueuer. ``DO UPDATE`` blocks on the other
+        an insert nor a row to return. ``DO UPDATE`` blocks on the other
         transaction and then returns the row that won.
         """
         row = await connection.fetchrow(
@@ -215,7 +214,7 @@ class Storage:
     ) -> list[ClaimedJob]:
         """Lease up to ``limit`` due jobs for ``worker_id``.
 
-        One short transaction, never held across user code (§3). Candidate rows
+        One short transaction, never held across user code. Candidate rows
         are taken with ``FOR UPDATE SKIP LOCKED``; a candidate that carries a
         named concurrency key must additionally win that key's slot, which is
         where two workers racing for one business resource are serialized.
@@ -464,7 +463,7 @@ class Storage:
 
         Clearing ``lease_token`` is what makes the stale holder's next write
         fail: its token no longer matches any row, so ``complete``/``fail``
-        raise :class:`LeaseLost` (§10.5). A job that has already used its last
+        raise :class:`LeaseLost`. A job that has already used its last
         attempt becomes a durable failure instead of looping forever, and a job
         cancelled while leased is finalized here if its holder never came back.
         """
@@ -528,8 +527,9 @@ class Storage:
         """Cancel a job.
 
         A pending job is cancelled outright. A leased job only gets
-        ``cancel_requested``; §5 makes cancellation cooperative, so the lease
-        holder -- or lease expiry -- finalizes it.
+        ``cancel_requested``. The lease holder sees it on its next heartbeat,
+        cancels the handler, and finalizes the job. Lease expiry finalizes it if
+        the holder never comes back.
         """
         row = await connection.fetchrow(self._sql.cancel, job_id)
         if row is None:
@@ -772,7 +772,7 @@ class Storage:
         """Record one occurrence and the job it produces, atomically.
 
         The job row and the occurrence row are written in a single transaction
-        (§6) -- a savepoint, when the caller already has one open. If the
+        (a savepoint, when the caller already has one open). If the
         occurrence key is already taken, the unique constraint rejects the
         insert, this scheduler's job is rolled back with it, and the caller
         learns it lost the race. If the process dies part way through, neither
@@ -1010,8 +1010,7 @@ class _Statements:
         # never executed at all; an unpaused one pays one read of a table that
         # holds a row per queue ever paused. Enforcing it here rather than in
         # Worker is what makes the pause hold for a worker that has not yet
-        # heard about it (0003_queue_pause.sql), which is stronger than either
-        # Oban's or River's in-process check.
+        # heard about it (0003_queue_pause.sql).
         self.claim_candidates = f"""
             SELECT id, concurrency_key, retry_policy::text AS retry_policy
             FROM {jobs}
@@ -1520,9 +1519,8 @@ class _Statements:
         """
 
         # Pausing an already-paused queue keeps the original paused_at and
-        # updated_at, so "paused since" survives a repeated call -- River's
-        # CASE-guarded UPDATE, expressed as an upsert because rqueue has no
-        # queue registry to UPDATE against.
+        # updated_at, so "paused since" survives a repeated call. An upsert,
+        # because there is no queue registry to UPDATE against.
         self.pause_queue = f"""
             INSERT INTO {pauses} (queue, paused_at, updated_at)
             VALUES ($1, now(), now())
