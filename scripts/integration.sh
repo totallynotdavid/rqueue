@@ -1,9 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# These tests own a disposable database on the project-local cluster and never
-# accept a production URL.
-base_url="${RQUEUE_DATABASE_URL:-postgresql://rqueue@127.0.0.1:5432/rqueue}"
+# Without RQUEUE_DATABASE_URL, each run owns a temporary PostgreSQL cluster on
+# its own port and removes it on exit. CI supplies a shared service container
+# through RQUEUE_DATABASE_URL instead. The tests borrow a database there and
+# do not manage that server's lifecycle.
+cluster="$(dirname "$0")/cluster.sh"
+base_url="${RQUEUE_DATABASE_URL:-}"
+cluster_dir=""
 database_name="rqueue_integration_$(date +%s)_$$"
 app_role="${database_name}_role"
 app_password="rqueue-integration-test-password"
@@ -20,11 +24,24 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-# CI supplies its own service container through RQUEUE_DATABASE_URL, so
-# db:start is skipped when it is set.
-if [ -z "${RQUEUE_DATABASE_URL:-}" ]; then
-    mise run db:start
-    export RQUEUE_LOCAL_DATABASE_OWNER=1
+cleanup() {
+    if [ -n "$cluster_dir" ]; then
+        bash "$cluster" stop "$cluster_dir"
+        rm -rf "$cluster_dir"
+    else
+        uv run python -m scripts.database drop \
+            --base-url "$base_url" \
+            --name "$database_name" \
+            --role "$app_role" >/dev/null
+    fi
+}
+trap cleanup EXIT
+
+if [ -z "$base_url" ]; then
+    cluster_dir="$(mktemp -d "${TMPDIR:-/tmp}/rqueue-integration.XXXXXX")"
+    base_url="$(bash "$cluster" start "$cluster_dir")"
+    RQUEUE_LOCAL_CLUSTER_PORT="$(cat "$cluster_dir/rqueue.port")"
+    export RQUEUE_LOCAL_CLUSTER_DIR="$cluster_dir" RQUEUE_LOCAL_CLUSTER_PORT
 fi
 
 admin_url="$(
@@ -39,14 +56,6 @@ app_url="$(
         --user "$app_role" \
         --password "$app_password"
 )"
-
-cleanup() {
-    uv run python -m scripts.database drop \
-        --base-url "$base_url" \
-        --name "$database_name" \
-        --role "$app_role" >/dev/null
-}
-trap cleanup EXIT
 
 # Schema changes run with the database-owner connection. The app role below is
 # deliberately limited to runtime DML on one queue.

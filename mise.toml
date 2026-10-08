@@ -36,42 +36,17 @@ doctor = [
   "uv run mypy --version",
 ]
 
-[tasks."db:init"]
-description = "Initialize the project-local PostgreSQL cluster"
-run = """
-data_dir="$PWD/.data/postgres"
-
-if [ ! -f "$data_dir/PG_VERSION" ]; then
-  mkdir -p "$data_dir"
-  mise x postgres -- initdb -D "$data_dir" -U rqueue \
-    --auth-host=trust --auth-local=trust --no-instructions
-fi
-"""
-
 [tasks."db:start"]
-description = "Start the project-local PostgreSQL cluster"
-depends = ["db:init"]
-run = """
-data_dir="$PWD/.data/postgres"
+description = "Start this worktree's PostgreSQL cluster and print its URL"
+run = 'bash scripts/cluster.sh start "$PWD/.data/postgres"'
 
-if ! mise x postgres -- pg_isready -h 127.0.0.1 -p 5432 -U rqueue -q; then
-  mise x postgres -- pg_ctl -D "$data_dir" \
-    -l "$data_dir/server.log" \
-    -o "-h 127.0.0.1 -p 5432 -c fsync=off -c synchronous_commit=off -c full_page_writes=off" \
-    -w start
-fi
-
-if ! mise x postgres -- psql -h 127.0.0.1 -p 5432 -U rqueue -d rqueue -qAtc "SELECT 1" >/dev/null 2>&1; then
-  mise x postgres -- createdb -h 127.0.0.1 -p 5432 -U rqueue rqueue
-fi
-"""
+[tasks."db:url"]
+description = "Print the URL of this worktree's PostgreSQL cluster"
+run = 'bash scripts/cluster.sh url "$PWD/.data/postgres"'
 
 [tasks."db:stop"]
-description = "Stop the project-local PostgreSQL cluster"
-run = """
-data_dir="$PWD/.data/postgres"
-mise x postgres -- pg_ctl -D "$data_dir" stop -m fast -w 2>/dev/null || true
-"""
+description = "Stop this worktree's PostgreSQL cluster"
+run = 'bash scripts/cluster.sh stop "$PWD/.data/postgres"'
 
 [tasks."db:reset"]
 description = "Delete the project-local PostgreSQL cluster"
@@ -83,6 +58,6 @@ rm -rf "$PWD/.data/postgres"
 [tasks."db:migrate"]
 description = "Apply rqueue migrations to the local development database"
 depends = ["db:start"]
-run = [
-  "uv run rqueue --database-url \"${RQUEUE_DATABASE_URL:-postgresql://rqueue@127.0.0.1:5432/rqueue}\" migrate",
-]
+run = """
+uv run rqueue --database-url "${RQUEUE_DATABASE_URL:-$(bash scripts/cluster.sh url "$PWD/.data/postgres")}" migrate
+"""
