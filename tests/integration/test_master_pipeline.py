@@ -1,4 +1,4 @@
-"""The master pipeline test from docs/requirements.md §11.
+"""The master pipeline test.
 
 One test that walks the whole lifecycle in a single run and asserts on durable
 state after every step. It is the outer-loop signal during development -- run
@@ -7,7 +7,7 @@ pipeline pass or fail in one shot::
 
     mise run test-pipeline
 
-It supplements the focused §10 tests rather than replacing them: those stay
+It supplements the focused integration tests rather than replacing them: those stay
 granular so a failure points at one mechanism, while this one catches the
 interactions between them.
 """

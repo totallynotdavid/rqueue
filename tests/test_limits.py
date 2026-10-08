@@ -1,4 +1,4 @@
-"""Resource bounds from docs/requirements.md §8."""
+"""Resource bounds on payloads, metadata, keys, and identifiers."""
 
 from __future__ import annotations
 

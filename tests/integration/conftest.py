@@ -84,7 +84,7 @@ def worker_id() -> Iterator[str]:
 async def widgets(pool: asyncpg.Pool) -> AsyncIterator[str]:
     """A real application table, in the application's own schema.
 
-    §10.1 and §10.2 are about business data and a queue job sharing one
+    Transactional enqueue is about business data and a queue job sharing one
     transaction, so the business side has to be real too.
     """
     name = f"widgets_{uuid.uuid4().hex[:12]}"

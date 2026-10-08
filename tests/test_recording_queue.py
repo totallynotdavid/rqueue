@@ -287,7 +287,7 @@ async def test_reset_clears_records_but_keeps_registrations(
 async def test_it_substitutes_for_a_real_queue_at_the_defer_seam(
     queue: RecordingQueue,
 ) -> None:
-    """picv-2025's shape: repository code takes a defer callback, unchanged."""
+    """Repository code takes a defer callback, unchanged."""
 
     async def enqueue_simulation(connection: Any, compute_job_id: uuid.UUID) -> Job:
         return await queue.enqueue(

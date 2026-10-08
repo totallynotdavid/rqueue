@@ -15,6 +15,6 @@ def offline_queue() -> Queue:
     """A Queue that never touches its pool.
 
     Registration and enqueue validation happen entirely in Python, so the fast
-    suite can exercise them without a database (§11).
+    suite can exercise them without a database.
     """
     return Queue(cast("asyncpg.Pool", None), name="fast")

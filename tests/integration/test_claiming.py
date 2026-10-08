@@ -1,4 +1,4 @@
-"""§10.4: many workers, at most one execution per successful lease attempt."""
+"""Many workers, at most one execution per successful lease attempt."""
 
 from __future__ import annotations
 
@@ -78,7 +78,7 @@ async def test_concurrent_claims_never_share_a_job(
 async def test_a_named_concurrency_key_serializes_execution(
     queue: Queue, pool: asyncpg.Pool
 ) -> None:
-    """§6: a concurrency key bounds concurrent *execution* of a shared resource."""
+    """A concurrency key bounds concurrent *execution* of a shared resource."""
     async with pool.acquire() as connection, connection.transaction():
         for index in range(3):
             await queue.enqueue(
@@ -131,7 +131,7 @@ async def test_a_named_concurrency_key_serializes_execution(
 async def test_a_concurrency_slot_is_a_lease_not_a_flag(
     queue: Queue, pool: asyncpg.Pool
 ) -> None:
-    """A crashed holder must not hold the resource forever (§6)."""
+    """A crashed holder must not hold the resource forever."""
     async with pool.acquire() as connection, connection.transaction():
         for index in range(2):
             await queue.enqueue(
@@ -271,7 +271,7 @@ async def test_a_worker_only_claims_task_names_it_registered(
 async def test_strict_startup_refuses_a_queue_it_cannot_serve(
     queue: Queue, pool: asyncpg.Pool
 ) -> None:
-    """§4: worker startup fails when queued work has no registered handler."""
+    """Worker startup fails when queued work has no registered handler."""
 
     async def known(payload: object, context: TaskContext) -> None:
         return None

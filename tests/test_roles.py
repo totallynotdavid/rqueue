@@ -1,4 +1,4 @@
-"""Guardrails on the grant model itself (§8).
+"""Guardrails on the grant model itself.
 
 The privilege *shapes* rqueue hands PostgreSQL are decided in Python, so they
 can be asserted without a database; the integration suite proves the resulting
@@ -38,7 +38,7 @@ def merged(*capabilities: Capability) -> dict[str, set[str]]:
 
 
 def test_a_producer_may_only_touch_updated_at() -> None:
-    """The enqueue conflict path needs UPDATE; §8 says only on that column."""
+    """The enqueue conflict path needs UPDATE, and only on that column."""
     assert merged(Capability.PRODUCE)["jobs"] == {
         "SELECT",
         "INSERT",
@@ -121,7 +121,7 @@ def test_the_purge_signature_matches_the_migration() -> None:
 
 
 def test_hardening_clears_every_elevated_attribute() -> None:
-    """§8: a repaired role keeps none of the attributes that outrank the model."""
+    """A repaired role keeps none of the attributes that outrank the model."""
     assert {clause for _, clause in _ELEVATED_ATTRIBUTES} == {
         "NOSUPERUSER",
         "NOCREATEDB",
@@ -136,7 +136,7 @@ def test_hardening_clears_every_elevated_attribute() -> None:
 
 
 async def test_granted_by_is_used_only_where_it_exists() -> None:
-    """§2 says PostgreSQL 14+; `GRANTED BY` on a membership REVOKE is 16+.
+    """PostgreSQL 14+ is supported, and `GRANTED BY` on a membership REVOKE is 16+.
 
     16 is where one membership became grantable several times by different
     roles, and where a bare REVOKE narrowed to "only the grant I made" -- so
@@ -168,10 +168,10 @@ async def test_granted_by_is_used_only_where_it_exists() -> None:
 
 
 def test_hardening_cannot_be_declined() -> None:
-    """§8 promises no opt-out, so there must be no argument that is one.
+    """Hardening has no opt-out, so there must be no argument that is one.
 
     The promise is only as good as the signature: a `harden=False`-shaped
-    parameter added later would leave the spec describing a guarantee the
+    parameter added later would leave the docs describing a guarantee the
     function no longer makes, and the caller's next act is handing out the
     role's credentials.
     """

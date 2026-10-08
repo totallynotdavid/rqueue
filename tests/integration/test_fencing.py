@@ -1,9 +1,8 @@
-"""§10.5: lease-token fencing.
+"""Lease-token fencing.
 
-This is the package's strongest guarantee over River and pgqueuer (§1, §3), so
-these tests do the real thing: a lease is held past its expiry, another worker
-takes the job over, and the stale holder then attempts every write it could
-make. None of them may land.
+This is the package's strongest guarantee, so these tests do the real thing: a
+lease is held past its expiry, another worker takes the job over, and the stale
+holder then attempts every write it could make. None of them may land.
 """
 
 from __future__ import annotations

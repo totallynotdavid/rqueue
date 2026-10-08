@@ -1,4 +1,4 @@
-"""§10.9: blocking handlers stay inside the configured concurrency bound."""
+"""Blocking handlers stay inside the configured concurrency bound."""
 
 from __future__ import annotations
 
@@ -33,7 +33,7 @@ class Peak:
 async def test_the_worker_executor_caps_concurrent_to_thread_work(
     queue: Queue, pool: asyncpg.Pool
 ) -> None:
-    """The bound §4 promises, measured on threads rather than on tasks.
+    """The documented bound, measured on threads rather than on tasks.
 
     One job's handler fires far more ``asyncio.to_thread`` calls than the
     worker's concurrency. Task-level concurrency cannot explain the result --
