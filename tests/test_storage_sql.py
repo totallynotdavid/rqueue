@@ -1,7 +1,7 @@
-"""Guardrails on the SQL layer itself (§8).
+"""Guardrails on the SQL layer itself.
 
 These do not need a database: they assert on the statement text rqueue builds,
-which is the thing §8 constrains.
+which is where caller-supplied values must stay out of the SQL string.
 """
 
 from __future__ import annotations

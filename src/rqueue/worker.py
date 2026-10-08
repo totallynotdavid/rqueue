@@ -10,11 +10,12 @@ import uuid
 from collections.abc import AsyncIterator, Awaitable
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
-from typing import Any, Final, Literal
+from typing import Any, Final
 
 import asyncpg
 
 from rqueue.context import TaskContext
+from rqueue.database_errors import raise_if_permanent
 from rqueue.errors import (
     CancelJob,
     ConfigurationError,
@@ -48,7 +49,7 @@ _LOGGER: Final = logging.getLogger("rqueue.worker")
 #: How long the loop waits after a database error before trying again. A
 #: PostgreSQL restart shows up here as a burst of connection errors; the worker
 #: reconnects through the pool and resumes, so a restart costs latency and
-#: never a job (§10.7).
+#: never a job.
 _ERROR_BACKOFF_SECONDS: Final = 1.0
 
 _DB_ERRORS: Final = (asyncpg.PostgresError, asyncpg.InterfaceError, OSError)
@@ -57,16 +58,13 @@ _DB_ERRORS: Final = (asyncpg.PostgresError, asyncpg.InterfaceError, OSError)
 class Worker:
     """Runs registered handlers for one queue with bounded concurrency.
 
-    The worker never holds a database transaction open across user code (§3):
+    The worker never holds a database transaction open across user code:
     claiming, heartbeating, and finalizing each borrow a pooled connection for
     the duration of one short statement and give it straight back.
 
-    ``executor_shutdown="wait"`` is the safe default: after in-flight leases
-    are handed back, shutdown waits for any blocking work submitted with
-    ``asyncio.to_thread`` to finish. ``executor_shutdown="detach"`` returns
-    without waiting for those threads, but does not stop them. The process must
-    be terminated by its supervisor after a detached shutdown; do not reuse
-    this Worker, its detached executor, or start new work in that process.
+    After in-flight leases are handed back, shutdown waits for any blocking
+    work submitted with ``asyncio.to_thread`` to finish. Python cannot stop a
+    running thread, so a thread that never returns keeps shutdown waiting.
     """
 
     def __init__(
@@ -80,7 +78,6 @@ class Worker:
         heartbeat_interval: float | None = None,
         poll_interval: float = 1.0,
         shutdown_timeout: float = 30.0,
-        executor_shutdown: Literal["wait", "detach"] = "wait",
         strict_tasks: bool = True,
         install_default_executor: bool = True,
         executor_max_workers: int | None = None,
@@ -108,11 +105,8 @@ class Worker:
             )
         if poll_interval <= 0:
             raise ValidationError("poll_interval must be positive")
-        if executor_shutdown not in ("wait", "detach"):
-            raise ValidationError("executor_shutdown must be either 'wait' or 'detach'")
         self.poll_interval = float(poll_interval)
         self.shutdown_timeout = float(shutdown_timeout)
-        self.executor_shutdown = executor_shutdown
         self.strict_tasks = strict_tasks
         self.install_default_executor = install_default_executor
         self.executor_max_workers = executor_max_workers or self.concurrency
@@ -131,8 +125,6 @@ class Worker:
         self._started = asyncio.Event()
         self._run_task: asyncio.Task[None] | None = None
         self._shutdown_timeout_override: float | None = None
-        self._wait_for_blocking_threads_override: bool | None = None
-        self._detached = False
 
     # ------------------------------------------------------------- lifecycle
 
@@ -142,12 +134,6 @@ class Worker:
         With ``until_idle`` the loop returns once a poll finds no claimable
         work and nothing is in flight -- what :meth:`drain` exposes.
         """
-        if self._detached:
-            raise ConfigurationError(
-                "worker cannot run after executor shutdown with "
-                "wait_for_blocking_threads=False; "
-                "terminate the process instead"
-            )
         if self._run_task is not None:
             raise ConfigurationError("worker is already running")
         self._run_task = asyncio.current_task()
@@ -164,7 +150,6 @@ class Worker:
         finally:
             self._run_task = None
             self._shutdown_timeout_override = None
-            self._wait_for_blocking_threads_override = None
 
     async def drain(self, *, timeout: float | None = None) -> None:
         """Run until the queue has no immediately claimable work left."""
@@ -179,21 +164,11 @@ class Worker:
         self._stop.set()
         self._wake.set()
 
-    async def shutdown(
-        self,
-        *,
-        timeout: float | None = None,
-        wait_for_blocking_threads: bool | None = None,
-    ) -> None:
+    async def shutdown(self, *, timeout: float | None = None) -> None:
         """Stop this run and wait for its bounded shutdown to complete.
 
         ``timeout`` overrides :attr:`shutdown_timeout` for the grace period
-        given to in-flight handlers. ``wait_for_blocking_threads`` overrides
-        the constructor's ``executor_shutdown`` mode for this shutdown. When
-        it is false, lease hand-back still happens, but this method returns
-        without waiting for a running ``asyncio.to_thread`` call. Such a
-        process must then be terminated by its supervisor and must not start
-        more work.
+        given to in-flight handlers.
 
         This method is intended to be called while :meth:`run` is running in a
         background task. Calling it before a run starts is a no-op.
@@ -204,7 +179,6 @@ class Worker:
         if run_task is None:
             return
         self._shutdown_timeout_override = timeout
-        self._wait_for_blocking_threads_override = wait_for_blocking_threads
         self.stop()
 
         if run_task is asyncio.current_task():
@@ -223,19 +197,16 @@ class Worker:
                     bounded_default_executor(
                         self.executor_max_workers,
                         thread_name_prefix=f"rqueue-{self.worker_id}",
-                        wait_for_blocking_threads=self._wait_for_blocking_threads,
                     )
                 )
             async with self._listener():
                 yield
-        if not self._wait_for_blocking_threads():
-            self._detached = True
 
     @asynccontextmanager
     async def _listener(self) -> AsyncIterator[None]:
         """Subscribe to the wake channel, if a connection can be spared.
 
-        Polling is the source of truth (§3). A listener that cannot be
+        Polling is the source of truth. A listener that cannot be
         established -- an exhausted pool, a role without LISTEN rights -- costs
         latency and nothing else, so it is logged and skipped.
         """
@@ -307,7 +278,8 @@ class Worker:
         while not self._stop.is_set():
             try:
                 claimed = await self._tick()
-            except _DB_ERRORS:
+            except _DB_ERRORS as exc:
+                raise_if_permanent(exc)
                 self.logger.warning(
                     "rqueue: worker %s could not reach PostgreSQL; retrying",
                     self.worker_id,
@@ -457,10 +429,7 @@ class Worker:
             for task in pending:
                 task.cancel()
             if pending:
-                cancel_wait = (
-                    0.0 if not self._wait_for_blocking_threads() else configured_grace
-                )
-                await asyncio.wait(pending, timeout=cancel_wait)
+                await asyncio.wait(pending, timeout=configured_grace)
 
         for entry in list(self._leases.values()):
             self._leases.pop(entry.job.id, None)
@@ -501,7 +470,7 @@ class Worker:
         try:
             payload = registration.decoder(job.payload)
         except Exception as exc:
-            # §4: decode failures are non-retryable and become a durable failed
+            # Decode failures are non-retryable and become a durable failed
             # job. The same payload cannot become valid on a later attempt.
             self.logger.warning(
                 "rqueue: payload for job %s failed to decode", job.id, exc_info=True
@@ -595,9 +564,9 @@ class Worker:
         if timeout is None:
             await registration.handler(payload, context)
             return
-        # §5: a timeout cancels the handler, but proves nothing about whether
-        # an external side effect already happened. The job retries under the
-        # normal policy; handlers are required to be idempotent (§3).
+        # A timeout cancels the handler, but proves nothing about whether an
+        # external side effect already happened. The job retries under the
+        # normal policy. Handlers must be idempotent.
         async with asyncio.timeout(timeout):
             await registration.handler(payload, context)
 
@@ -788,17 +757,11 @@ class Worker:
                 self.worker_id,
             )
 
-    def _wait_for_blocking_threads(self) -> bool:
-        override = self._wait_for_blocking_threads_override
-        if override is not None:
-            return override
-        return self.executor_shutdown == "wait"
-
 
 def _describe(exc: BaseException) -> str:
     """One bounded, sanitized line about a failure.
 
-    Full tracebacks go to the structured worker log (§5); the row keeps only
+    Full tracebacks go to the structured worker log; the row keeps only
     enough for an operator to recognize the failure.
     """
     text = str(exc).strip()

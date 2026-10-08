@@ -34,8 +34,7 @@ dev = [
 target-version = "py313"
 line-length = 88
 indent-width = 4
-# Markdown is excluded so the formatter never rewrites docs/requirements.md, which
-# is the spec this package is built against, not source to be reformatted.
+# Markdown is excluded so the formatter never rewrites the docs.
 extend-exclude = ["__pycache__", "dist", "build", ".data", "*.md"]
 
 [tool.ruff.lint]

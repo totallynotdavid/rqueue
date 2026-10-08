@@ -31,6 +31,32 @@ def test_checksums_are_stable_and_distinct() -> None:
     assert len({m.checksum for m in loaded}) == len(loaded)
 
 
+#: sha256 of each released migration file. A database records these, and
+#: ``migrate`` and ``status`` refuse one whose file differs, comments included.
+_RELEASED_CHECKSUMS: Final = {
+    1: "65d25c8b12cc81b31bb0b700b105535968a1be5837225493955da2ff34b487d8",
+    2: "cf3abfe0f6aa9e20e46382555078bd7542b4d66e4b90055c2bc9b872be6f4c9e",
+    3: "29f69063ae55bcd50ae1faa6d48840df1ec339e06f29fdb2a03f3b3a934cf6e6",
+    4: "2e1368f3ddcba18fd7fd7dd0729e083fef9dcaf81cb69f1a0efda07ffc6dd691",
+    5: "3fc8ed3fa8084c6c1a203f587738fd739aaa5163bd3079ac69770a046565fc6b",
+    6: "b1eab9efb4803f9d5cb99831d5812ae8e55dc1cdaa1141a8f8c757e6d424e3b3",
+    7: "a221609df90c9bc5e165a2fd43cf34366074f8a1d9465d325b780f3687a6b079",
+    8: "6b1794b040c2137488e1968b3054211ff0114dad97f785b70e8fa6f7f50cc645",
+    9: "b4c8b6bc76b120e26cee0c7805b757ef5494c66b64c040c03a2647efa45e4ccc",
+    10: "02dc3f8e920d1632ee96acaf64013cc9fe98359588d169300197a83a6fcfa678",
+    11: "c01a196caafe4b9292c951f9934d3abcb9c03fed639c6903e70e3b080d9f7778",
+}
+
+
+def test_a_released_migration_file_is_unchanged() -> None:
+    packaged = {m.version: m.checksum for m in migrations.load_migrations()}
+    for version, released in _RELEASED_CHECKSUMS.items():
+        assert packaged[version] == released, (
+            f"migration {version:04d} differs from the released file; a database "
+            "that applied it would refuse to migrate. Add a new migration instead."
+        )
+
+
 def test_schema_placeholder_is_the_only_interpolation() -> None:
     # Anything else in braces would be an accidental format field.
     pattern = re.compile(r"\{([^}]*)\}")
@@ -92,7 +118,7 @@ QUEUE_SCOPED_TABLES: Final = (
 
 
 def test_every_queue_scoped_table_has_row_level_security_enabled() -> None:
-    """§8: the boundary covers every table that holds queue-scoped work.
+    """The boundary covers every table that holds queue-scoped work.
 
     Only the ENABLE, not the policies: a policy can be dropped and replaced by
     a later migration -- 0008 replaces the heartbeat one with four narrower

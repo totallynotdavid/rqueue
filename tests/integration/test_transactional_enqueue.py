@@ -1,4 +1,4 @@
-"""§10.1 and §10.2: the producer transaction is the unit of durability."""
+"""The producer transaction is the unit of durability."""
 
 from __future__ import annotations
 
@@ -37,7 +37,7 @@ async def test_declared_defaults_are_persisted_without_a_handler(
 async def test_rolled_back_producer_leaves_no_business_row_and_no_job(
     queue: Queue, pool: asyncpg.Pool, widgets: str
 ) -> None:
-    """§10.1"""
+    """A rollback takes the business row and the job away together."""
     widget_id = uuid.uuid4()
     async with pool.acquire() as connection:
         with pytest.raises(RuntimeError):
@@ -68,7 +68,7 @@ async def test_rolled_back_producer_leaves_no_business_row_and_no_job(
 async def test_committed_producer_exposes_business_row_and_job(
     queue: Queue, pool: asyncpg.Pool, widgets: str
 ) -> None:
-    """§10.2"""
+    """A commit makes the business row and the job visible together."""
     widget_id = uuid.uuid4()
     async with pool.acquire() as connection, connection.transaction():
         await connection.execute(

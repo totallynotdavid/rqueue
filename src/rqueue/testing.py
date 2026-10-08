@@ -6,15 +6,14 @@ full path::
     from rqueue.testing import RecordingQueue
 
 so that "this is a test tool, not production wiring" is unambiguous from the
-import line alone. This mirrors Procrastinate, whose ``InMemoryConnector``
-lives in ``procrastinate.testing`` rather than in its top-level package.
+import line alone.
 
 What it is for
 --------------
 
 A consumer application wants to unit-test the seam where its business code
-asks for a job -- picv-2025's ``repository.create_or_get_job(..., defer=...)``
-is the motivating shape -- without starting PostgreSQL. Substituting a bare
+asks for a job, such as a repository function that takes a ``defer`` callback,
+without starting PostgreSQL. Substituting a bare
 ``AsyncMock`` proves only that *a* callback ran with *some* arguments.
 :class:`RecordingQueue` proves more: it runs the *real* validation path,
 :meth:`rqueue.Queue.build_insert`, which is a pure function with no database

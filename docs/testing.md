@@ -1,33 +1,33 @@
-# Testing your enqueue calls without PostgreSQL
+# Testing
+
+## Test enqueue calls without PostgreSQL
 
 `rqueue.testing.RecordingQueue` is a `Queue` that runs the real validation and
-records the result instead of writing it. A consumer can unit-test "does my code
-enqueue the right job" with no database.
+records the result instead of writing it. Use it to test that your code enqueues
+the right job, with no database.
 
-It is deliberately **not** exported from the `rqueue` package. Import it by its
-full path, so a test tool can never be mistaken for production wiring:
+`rqueue` does not export it. Import it by its full path, so test code is not
+mistaken for production wiring:
 
 ```python
+import uuid
+
 from rqueue.testing import RecordingQueue
+
+from app.queueing import make_enqueue_simulation
+from app.repository import create_or_get_job
+from app.tasks import prepare_simulation
 
 queue = RecordingQueue(name="compute")
 queue.register(name="prepare_simulation", handler=prepare_simulation)
 
 
-# The same app/queueing.py callback as in Enqueueing, unchanged.
-async def enqueue_simulation(connection, compute_job_id):
-    return await queue.enqueue(
-        connection,
-        task="prepare_simulation",
-        payload={"compute_job_id": str(compute_job_id)},
-        dedupe_key=f"simulation:{compute_job_id}",
-        on_conflict="return_existing",
-    )
-
-
-async def test_creating_a_compute_job_enqueues_one():
+async def test_creating_a_compute_job_enqueues_one(connection):
     record = await create_or_get_job(
-        data=..., simulation_id=sid, defer=enqueue_simulation
+        connection,
+        data=...,
+        simulation_id=uuid.uuid4(),
+        defer=make_enqueue_simulation(queue),
     )
 
     (recorded,) = queue.enqueued("prepare_simulation")
@@ -35,34 +35,43 @@ async def test_creating_a_compute_job_enqueues_one():
     assert recorded.dedupe_key == f"simulation:{record.id}"
 ```
 
-Call sites do not change between test and production. `RecordingQueue`
-subclasses `Queue`, and its connection argument is accepted, recorded, and
-ignored (it defaults to `None`), so no `if TESTING:` branch is needed anywhere.
+`make_enqueue_simulation` and `create_or_get_job` are the functions from
+[Enqueueing](enqueueing.md#keep-business-code-free-of-the-queue-import),
+unchanged. `connection` is whatever your repository code needs for its own
+tables, such as a fixture for your test database. The recording queue only
+replaces rqueue's tables.
 
-## What a recorded call proves
+Call sites are the same in tests and in production. `RecordingQueue` subclasses
+`Queue`. It accepts the connection argument, records it, and ignores it, so the
+argument defaults to `None` and no `if TESTING:` branch is needed. See
+[Enqueueing](enqueueing.md#keep-business-code-free-of-the-queue-import) for the
+callback pattern.
 
-A recorded call goes through the same `Queue.build_insert` production uses. It
-proves the call is well-formed and the real queue would accept it:
+## What a recorded call shows
 
-* The task name is valid and either declared or registered, so a typo fails the
+A recorded call goes through the `Queue.build_insert` that production uses. It
+shows that the call is well formed and that the real queue would accept it:
+
+- The task name is valid and either declared or registered, so a typo fails the
   test.
-* The payload and metadata are JSON and within their size bounds.
-* `dedupe_key` is paired with an explicit `on_conflict`.
-* `scheduled_at` and `delay` are not both set.
-* The task's retry and timeout defaults were applied.
+- The payload and metadata are JSON and within their size limits.
+- `dedupe_key` comes with an explicit `on_conflict`.
+- `scheduled_at` and `delay` are not both set.
+- The task's retry and timeout defaults were applied.
 
-## What it does not prove
+## What it does not show
 
-`RecordingQueue` is a recorder, not a simulator. It does not model
-transactionality, dedupe conflict resolution, concurrency slots, claiming,
-leases, state transitions, or scheduling. Two calls sharing a `dedupe_key`
-record two jobs, and `on_conflict="raise"` never raises. Returned `Job` values
-are synthesized locally, with a fresh id, `state=pending`, and local timestamps.
+`RecordingQueue` records. It does not simulate. It does not model transactions,
+dedupe conflicts, concurrency slots, claiming, leases, state changes, or
+scheduling. Two calls with the same `dedupe_key` record two jobs, and
+`on_conflict="raise"` never raises. The returned `Job` is built locally, with a
+new id, `state=pending`, and local timestamps.
 
-For any of that, write an integration test against a real PostgreSQL database.
+To test any of that, write an integration test against PostgreSQL. See
+[contributing](../.github/contributing.md#checks).
 
-## Reading the recording
+## Read the recording
 
-`RecordingQueue.recorded` is the full list of `RecordedEnqueue` records. Each
-has the original `request`, the validated `spec`, and the synthesized `job`.
-`enqueued(task=None)` filters the list and `reset()` clears it.
+`RecordingQueue.recorded` lists every `RecordedEnqueue`. Each has the original
+`request`, the validated `spec`, and the built `job`. `enqueued(task=None)`
+filters the list, and `reset()` clears it.

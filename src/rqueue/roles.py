@@ -1,4 +1,4 @@
-"""Least-privilege PostgreSQL roles for producers, workers, and schedulers (§8).
+"""Least-privilege PostgreSQL roles for producers, workers, and schedulers.
 
 Three separations matter here:
 
@@ -71,7 +71,7 @@ class Capability(enum.StrEnum):
 # path), and PostgreSQL demands UPDATE privilege on every column named in a
 # ``DO UPDATE SET`` -- even one that writes a column back to its own value. A
 # whole-table UPDATE would also let a producer rewrite ``state``, ``payload``,
-# or ``attempt``, which is exactly what §8 says a producer may not do.
+# or ``attempt``, which a producer must not be able to do.
 _TABLE_GRANTS: dict[Capability, tuple[tuple[str, str], ...]] = {
     Capability.PRODUCE: (
         ("jobs", "SELECT, INSERT, UPDATE (updated_at)"),
@@ -241,7 +241,7 @@ async def _revoke_memberships(connection: asyncpg.Connection, role: str) -> None
     # grantor is the only way to reach those on 16 and later.
     #
     # It is also the release that added the clause. On 14 and 15 it is a syntax
-    # error, and §2 commits to 14+. Nothing is lost by omitting it there: those
+    # error, and the package supports 14+. Nothing is lost by omitting it there: those
     # versions record a single grantor per membership, so the bare REVOKE that
     # is all they accept removes the membership outright, which is exactly the
     # outcome the clause buys on 16.

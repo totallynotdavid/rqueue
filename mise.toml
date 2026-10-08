@@ -24,8 +24,6 @@ fix = ["uv run ruff check --fix --unsafe-fixes .", "uv run ruff format ."]
 test = "uv run pytest -n auto -m 'not integration'"
 test-integration = "bash scripts/integration.sh"
 
-# The master pipeline test from docs/requirements.md section 11, on its own, for the
-# development outer loop.
 test-pipeline = "bash scripts/integration.sh tests/integration/test_master_pipeline.py"
 
 db = "mise run db:start"
@@ -86,5 +84,5 @@ rm -rf "$PWD/.data/postgres"
 description = "Apply rqueue migrations to the local development database"
 depends = ["db:start"]
 run = [
-  "uv run rqueue migrate --database-url \"${RQUEUE_DATABASE_URL:-postgresql://rqueue@127.0.0.1:5432/rqueue}\"",
+  "uv run rqueue --database-url \"${RQUEUE_DATABASE_URL:-postgresql://rqueue@127.0.0.1:5432/rqueue}\" migrate",
 ]

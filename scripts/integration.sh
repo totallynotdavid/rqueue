@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # These tests own a disposable database on the project-local cluster and never
-# accept a production URL. Mirrors picv-2025's scripts/integration.sh.
+# accept a production URL.
 base_url="${RQUEUE_DATABASE_URL:-postgresql://rqueue@127.0.0.1:5432/rqueue}"
 database_name="rqueue_integration_$(date +%s)_$$"
 app_role="${database_name}_role"
@@ -20,8 +20,8 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-# CI supplies its own service container through RQUEUE_DATABASE_URL, the way
-# picv-2025 skips db:start when COMPUTE_DATABASE_URL is set.
+# CI supplies its own service container through RQUEUE_DATABASE_URL, so
+# db:start is skipped when it is set.
 if [ -z "${RQUEUE_DATABASE_URL:-}" ]; then
     mise run db:start
     export RQUEUE_LOCAL_DATABASE_OWNER=1

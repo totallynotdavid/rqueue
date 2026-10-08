@@ -2,7 +2,7 @@
 
 Two families live here. `RqueueError` and its subclasses report failures of the
 queue itself. `Retry`, `PermanentFailure`, and `CancelJob` are control-flow
-signals a task handler raises to choose its own outcome (docs/requirements.md §5).
+signals a task handler raises to choose its own outcome.
 """
 
 from __future__ import annotations
@@ -34,14 +34,14 @@ class ConfigurationError(RqueueError):
 
 
 class ValidationError(RqueueError):
-    """A caller-supplied value violated a documented bound or shape (§8)."""
+    """A caller-supplied value violated a documented bound or shape."""
 
 
 class AlreadyEnqueued(RqueueError):
     """An active job already holds the requested dedupe key.
 
     Raised only when the caller asked for ``on_conflict="raise"``; the
-    alternative is ``on_conflict="return_existing"`` (§3).
+    alternative is ``on_conflict="return_existing"``.
     """
 
     def __init__(self, dedupe_key: str, queue: str, existing_job_id: object) -> None:
@@ -63,14 +63,14 @@ class ScheduleNotFound(RqueueError):
 
 
 class UnknownTask(RqueueError):
-    """A task name has no registered handler on this worker (§4)."""
+    """A task name has no registered handler on this worker."""
 
 
 class LeaseLost(RqueueError):
     """The lease token presented for a write is no longer the current one.
 
-    This is the fencing rejection from §3: a worker that stalled past its lease
-    expiry cannot overwrite the attempt that replaced it.
+    This is the fencing rejection: a worker that stalled past its lease expiry
+    cannot overwrite the attempt that replaced it.
     """
 
 
@@ -79,11 +79,11 @@ class InvalidStateTransition(RqueueError):
 
 
 class MigrationError(RqueueError):
-    """The migration runner refused to apply or verify a migration (§7)."""
+    """The migration runner refused to apply or verify a migration."""
 
 
 class Retry(Exception):
-    """Raised by a handler to request another attempt at a chosen time (§5)."""
+    """Raised by a handler to request another attempt at a chosen time."""
 
     def __init__(
         self,
@@ -105,4 +105,4 @@ class PermanentFailure(Exception):
 
 
 class CancelJob(Exception):
-    """Raised by a handler to finalize its job as cancelled (§5)."""
+    """Raised by a handler to finalize its job as cancelled."""

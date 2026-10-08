@@ -1,8 +1,8 @@
-"""Validated cron expressions for periodic schedules (docs/requirements.md §6).
+"""Validated cron expressions for periodic schedules.
 
 Standard five-field cron (minute hour day-of-month month day-of-week) plus the
 usual ``@hourly``/``@daily``/... macros. Written here rather than taken as a
-dependency because §2 makes ``asyncpg`` the only required runtime dependency.
+dependency because ``asyncpg`` is the only required runtime dependency.
 
 Occurrence instants are computed in the schedule's own timezone, so a "03:00
 local" schedule stays at 03:00 across a daylight-saving change.

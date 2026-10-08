@@ -202,10 +202,9 @@ class TaskRegistration:
     def __post_init__(self) -> None:
         if not callable(self.handler):
             raise ConfigurationError(f"handler for task {self.name!r} is not callable")
-        # §4 is async-only on purpose: pgqueuer shipped sync-handler support and
-        # removed it again. One execution path, and blocking work is wrapped by
-        # the handler with asyncio.to_thread, which the Worker's bounded default
-        # executor then caps.
+        # Handlers are async-only on purpose: one execution path, with blocking
+        # work wrapped by the handler in asyncio.to_thread, which the Worker's
+        # bounded default executor then caps.
         if not inspect.iscoroutinefunction(self.handler):
             raise ConfigurationError(
                 f"handler for task {self.name!r} must be an 'async def' function; "

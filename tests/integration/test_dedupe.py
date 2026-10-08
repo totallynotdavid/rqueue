@@ -1,4 +1,4 @@
-"""§10.3: concurrent producers cannot create duplicate active jobs for a key."""
+"""Concurrent producers cannot create duplicate active jobs for a key."""
 
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ async def test_second_producer_waits_and_receives_the_existing_job(
     """The losing producer gets the winner's job, not silence.
 
     ``ON CONFLICT DO NOTHING`` would return nothing here, because it does not
-    wait for the in-flight inserter -- the failure mode §1 calls out. The
+    wait for the in-flight inserter, so the loser would get silence. The
     ``DO UPDATE`` arbiter blocks until the first producer commits and then
     returns the row that won.
     """

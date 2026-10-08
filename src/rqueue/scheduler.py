@@ -1,4 +1,4 @@
-"""Periodic schedules, fired through the occurrence-key table (§6).
+"""Periodic schedules, fired through the occurrence-key table.
 
 There is no leader election and no schedule-row claim. Each tick works out
 which occurrences are due, then tries to insert ``(schedule_id,
@@ -22,6 +22,7 @@ from typing import Any, Final
 import asyncpg
 
 from rqueue.cron import CronExpression, resolve_timezone
+from rqueue.database_errors import raise_if_permanent
 from rqueue.errors import ValidationError
 from rqueue.limits import (
     MAX_CONCURRENCY_KEY_LENGTH,
@@ -137,7 +138,8 @@ class Scheduler:
         while not self._stop.is_set():
             try:
                 await self.tick()
-            except _DB_ERRORS:
+            except _DB_ERRORS as exc:
+                raise_if_permanent(exc)
                 self.logger.warning(
                     "rqueue: scheduler %s could not reach PostgreSQL; retrying",
                     self.scheduler_id,
@@ -190,7 +192,7 @@ class Scheduler:
         default for schedules that do not name one, not a queue this scheduler
         is feeding -- and claiming it would be both untrue and, for a role not
         granted that queue, an ``InsufficientPrivilegeError`` on every tick,
-        which :meth:`run` would retry forever. So a scheduler with no enabled
+        which would stop :meth:`run`. So a scheduler with no enabled
         schedules reports as unavailable, because it is: nothing is scheduling
         anything.
 

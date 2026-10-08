@@ -226,7 +226,7 @@ async def test_the_wildcard_resume_wakes_a_worker_that_has_no_row_of_its_own(
 async def test_a_pause_survives_the_workers_that_never_saw_it(
     queue: Queue, pool: asyncpg.Pool, admin: Admin
 ) -> None:
-    """The durability difference from Oban: the row outlives every process."""
+    """A pause is a row, so it outlives every process."""
     ran: list[uuid.UUID] = []
 
     async def work(payload: dict[str, int], context: TaskContext) -> None:
@@ -306,7 +306,7 @@ async def test_a_scoped_role_cannot_pause_or_resume_a_queue(
 async def test_a_scoped_worker_role_can_read_the_pause_it_must_obey(
     app_dsn: str | None, admin: Admin, pool: asyncpg.Pool
 ) -> None:
-    """§8's least-privilege role still has to see the gate in the claim query."""
+    """A least-privilege role still has to see the gate in the claim query."""
     if app_dsn is None:
         pytest.skip("needs the scoped role from scripts/integration.sh")
 

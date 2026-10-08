@@ -1,4 +1,4 @@
-"""Inspection and administration operations (docs/requirements.md §4, §7).
+"""Inspection and administration operations.
 
 These are deliberately outside :class:`~rqueue.context.TaskContext`: a handler
 cannot retry, cancel, or purge anything. They are for operators, admin
@@ -73,8 +73,9 @@ class Admin:
         """Cancel a job.
 
         A pending job is cancelled outright and will never run. A leased job is
-        only *asked* to stop: §5 makes cancellation cooperative, so the lease
-        holder finalizes it, or lease expiry does.
+        only *asked* to stop: its worker cancels the handler on the next
+        heartbeat and finalizes the job, or lease expiry does if the worker is
+        gone.
         """
         async with self.pool.acquire() as connection:
             return await self.storage.cancel(connection, job_id)
@@ -86,7 +87,9 @@ class Admin:
         scheduled_at: datetime | None = None,
         additional_attempts: int = 1,
     ) -> Job:
-        """Make a terminal job runnable again -- the operator retry from §3.
+        """Make a terminal job runnable again.
+
+        This is the operator retry path.
 
         This is the only path out of a terminal state. The attempt counter keeps
         counting rather than resetting, so the immutable attempt history stays

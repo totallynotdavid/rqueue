@@ -1,4 +1,4 @@
-"""§10.8: periodic schedules fire once per occurrence, across replicas."""
+"""Periodic schedules fire once per occurrence, across replicas."""
 
 from __future__ import annotations
 
@@ -81,13 +81,12 @@ async def test_replicas_racing_for_one_occurrence_fire_it_once(
 async def test_a_crash_between_occurrence_and_job_loses_neither(
     queue: Queue, pool: asyncpg.Pool
 ) -> None:
-    """§10.8's crash case.
+    """The crash case.
 
     The occurrence row and its job are written in one transaction, so a
     scheduler that dies before commit leaves nothing behind -- not a
     half-recorded occurrence, and not an advanced ``next_run`` that would skip
-    the firing entirely (the gap in the claim-the-schedule-row design §6
-    rejects).
+    the firing entirely.
     """
     scheduler, stored = await make_schedule(queue)
     moment = stored.created_at + timedelta(minutes=4)
@@ -142,7 +141,7 @@ async def test_catch_up_after_an_outage_is_bounded(queue: Queue) -> None:
 
 
 async def test_a_restarted_scheduler_does_not_refire(queue: Queue) -> None:
-    """§10.7: a scheduler restart delays work at most."""
+    """A scheduler restart delays work at most."""
     name = f"sched-{uuid.uuid4().hex[:12]}"
     first = Scheduler(queue, scheduler_id="sched-a", schedules=[spec(name)])
     (stored,) = await first.sync()

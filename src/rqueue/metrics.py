@@ -1,4 +1,4 @@
-"""Structured metrics and logging hooks (docs/requirements.md §7).
+"""Structured metrics and logging hooks.
 
 No metrics vendor is required or assumed. The queue calls a small sink
 protocol; the default drops everything, and :class:`LoggingMetricsSink` turns
@@ -21,7 +21,7 @@ __all__ = [
 class MetricsSink(Protocol):
     """Where the worker and scheduler report what they observed.
 
-    The emitted series are the ones §7 names:
+    The emitted series are:
 
     ``rqueue.queue.depth``            gauge, jobs pending or leased
     ``rqueue.queue.ready``            gauge, jobs eligible right now

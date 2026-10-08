@@ -1,4 +1,4 @@
-"""Per-task retry policy (docs/requirements.md §5).
+"""Per-task retry policy.
 
 The persisted ``attempt`` column is the sole authority for how many attempts a
 job has had; nothing here keeps in-process state, so a worker restart or a

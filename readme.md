@@ -1,107 +1,79 @@
 # rqueue
 
-A durable PostgreSQL task queue for Python applications that already speak
-[asyncpg](https://github.com/MagicStack/asyncpg).
+A durable task queue for Python applications that use
+[asyncpg](https://github.com/MagicStack/asyncpg). Jobs live in PostgreSQL, so
+you enqueue one in the same transaction as your own writes. If the transaction
+rolls back, the job rolls back with it.
 
-Its defining feature is **transactional enqueueing**. Your application writes
-its own rows and enqueues a job through the *same* `asyncpg.Connection` and the
-same PostgreSQL transaction. If that transaction rolls back, the job rolls back
-with it.
+rqueue needs Python 3.13+ and PostgreSQL 14+. `asyncpg` is its only runtime
+dependency. Handlers are `async def`, payloads are JSON, and delivery is at
+least once.
 
-`asyncpg` is the only required runtime dependency and the only database driver
-in the process. [docs/requirements.md](docs/requirements.md) is the full
-specification this package implements, including why it exists rather than
-adopting Procrastinate or pgqueuer.
+## Get started
 
-## Guarantees
-
-* **Delivery is at least once.** A handler may run again after a crash, a lease
-  expiry, or an ambiguous network failure. Handlers and their external side
-  effects must be idempotent. rqueue does not offer exactly-once execution.
-* **Leases are fenced.** A claim mints a fresh `lease_token`. Every write a
-  worker makes carries it, and a SQL predicate on it gates every such write. The
-  predicates are the `heartbeat` and finalizing statements in
-  [`src/rqueue/storage.py`](src/rqueue/storage.py). A worker that stalls past its
-  lease cannot overwrite the attempt that replaced it. River and pgqueuer do not
-  provide this guarantee. [Requirements §1](docs/requirements.md) compares the
-  three.
-* **State transitions are enforced in SQL**, not only in Python. A terminal job
-  becomes runnable again through exactly one path: the explicit operator retry
-  (`Admin.retry_job`, see [Operations](docs/operations.md)).
-
-## Requirements
-
-* Python 3.13+
-* PostgreSQL 14+
-
-## Quickstart
-
-Install the schema. Migrations never run implicitly, not at import and not at
-worker startup:
+From a checkout of this repository:
 
 ```console
+$ pip install .
 $ rqueue --database-url "$DATABASE_URL" migrate
 ```
 
-Register a task, enqueue a job inside your own transaction, and run a worker:
+`migrate` creates the `task_queue` schema. It is the only thing that changes the
+schema. Importing rqueue or starting a worker never does.
+
+Register a task, enqueue a job inside a transaction, and run a worker:
 
 ```python
+import asyncio
+import os
+
 import asyncpg
 from rqueue import Queue, Worker
 
-pool = await asyncpg.create_pool(DATABASE_URL)
-queue = Queue(pool, name="compute")
+
+async def main():
+    pool = await asyncpg.create_pool(os.environ["DATABASE_URL"])
+    queue = Queue(pool, name="compute")
+
+    @queue.task(name="greet")
+    async def greet(payload, context):
+        print("hello,", payload["name"])
+
+    async with pool.acquire() as connection:
+        async with connection.transaction():
+            await queue.enqueue(connection, task="greet", payload={"name": "world"})
+
+    await Worker(queue, worker_id="worker-1").drain()
 
 
-@queue.task(name="prepare_simulation")
-async def prepare_simulation(payload, context):
-    ...
-
-
-async with pool.acquire() as connection:
-    async with connection.transaction():
-        await app_db.execute(create_compute_job(...))
-        await queue.enqueue(
-            connection,
-            task="prepare_simulation",
-            payload={"compute_job_id": str(compute_job_id)},
-            dedupe_key=f"simulation:{external_id}",
-            on_conflict="return_existing",
-        )
-
-worker = Worker(queue, worker_id="api-worker-1", concurrency=4)
-await worker.run()
+asyncio.run(main())
 ```
+
+`drain()` runs until no claimable job is left. A long-running service calls
+`run()` instead.
+
+## Features
+
+- Transactional enqueue on your own `asyncpg.Connection`
+- At-least-once delivery. Leases carry a fencing token, so a worker that stalls
+  past its lease cannot overwrite the attempt that replaced it
+- Deduplication of queued jobs with `dedupe_key`
+- Mutual exclusion of running jobs on a shared resource with `concurrency_key`
+- Priorities and delayed jobs
+- Retries with exponential backoff and jitter, per-task timeouts, and
+  cancellation of running jobs
+- Periodic schedules from cron expressions with time zones. Several scheduler
+  replicas are safe
+- Pausing a queue for every worker replica at once
+- Least-privilege PostgreSQL roles for producing, consuming, scheduling,
+  inspecting, and purging, scoped to queues with row-level security
+- A command line and an `Admin` API for inspecting, cancelling, retrying, and
+  purging jobs
+- Readiness checks and a metrics hook that needs no metrics vendor
+- `RecordingQueue`, which unit-tests enqueue calls without a database
 
 ## Documentation
 
-Setup and usage:
-
-* [Migrations](docs/migrations.md): install the schema and upgrade between releases.
-* [Tasks](docs/tasks.md): register handlers, declare tasks for producer-only
-  processes, and decide what a failed attempt records.
-* [Enqueueing](docs/enqueueing.md): enqueue inside your own transaction.
-* [Running a worker](docs/worker.md): start, stop, and drain a worker, and run
-  blocking work.
-* [Testing](docs/testing.md): unit-test enqueue calls without PostgreSQL.
-
-Behavior:
-
-* [Keys](docs/keys.md): `dedupe_key` and `concurrency_key`.
-* [Ordering and fairness](docs/ordering.md)
-* [Retries, timeouts, and cancellation](docs/retries.md)
-* [Pausing a queue](docs/pausing.md)
-* [Periodic schedules](docs/scheduling.md)
-
-Operating rqueue:
-
-* [Operations](docs/operations.md): the CLI, `Admin`, readiness, and metrics.
-* [Least-privilege roles](docs/roles.md): capabilities, row-level security, and
-  `provision_role`.
-* [Storage](docs/storage.md): the tables and the module layout.
-
-Project:
-
-* [Development](docs/development.md): build, test, and run the integration suite.
-* [Requirements](docs/requirements.md): the design specification and its revision history.
-* [Independent review](docs/review-report.md): findings from a review of the implementation.
+The [manual](docs/readme.md) covers each feature.
+[docs/architecture.md](docs/architecture.md) is the map of the code. To change
+rqueue, read [.github/contributing.md](.github/contributing.md).

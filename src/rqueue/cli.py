@@ -1,4 +1,4 @@
-"""``rqueue`` command line: migrations and operational maintenance (§7).
+"""``rqueue`` command line: migrations and operational maintenance.
 
 Migrations run only from here (or from an explicit call to
 :func:`rqueue.migrations.migrate`). Importing rqueue, constructing a Queue, or

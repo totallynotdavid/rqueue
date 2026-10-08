@@ -1,4 +1,4 @@
-"""§10.6: retry, timeout, cancellation, and terminal failure are durable."""
+"""Retry, timeout, cancellation, and terminal failure are durable."""
 
 from __future__ import annotations
 
