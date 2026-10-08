@@ -13,8 +13,11 @@ Python, uv, and PostgreSQL. PostgreSQL runs as a project-local cluster in
 
 ```console
 $ mise run install    # uv sync --group dev
-$ mise run db:start   # initialize .data/postgres on first run, then start it
+$ mise run db:start   # initialize .data/postgres on first run, start it, print its URL
 ```
+
+Each worktree has its own cluster on a free port that the first `db:start` picks
+and records. `mise run db:url` prints the URL, and `db:migrate` uses it.
 
 ## Checks
 
@@ -49,7 +52,8 @@ The fast suite needs no database. Integration tests are marked
    `scoped`. The tests that exercise least-privilege behavior connect as this
    role.
 4. Runs `pytest -m integration`.
-5. Drops the database and the role on exit, also when the tests fail.
+5. Drops the database and the role on exit, also when the tests fail. A cluster
+   the script started itself is stopped and deleted instead.
 
 Paths after the script name go to pytest. Put other pytest options after `--`:
 
@@ -58,9 +62,12 @@ $ bash scripts/integration.sh tests/integration/test_master_pipeline.py
 $ bash scripts/integration.sh -- tests/integration/test_operations.py -k 0010
 ```
 
-By default the script starts the local cluster with `mise run db:start`. To use
-another server, set `RQUEUE_DATABASE_URL` to a URL whose user can create
-databases and roles. The script then skips `db:start`. CI does this with a
+By default every run starts its own PostgreSQL cluster in a temporary directory
+on a free port and removes it on exit, so runs never share a server and any
+number of them can run at once. One test stops and starts that cluster to check
+that a database restart only delays work. To use another server, set
+`RQUEUE_DATABASE_URL` to a URL whose user can create databases and roles. The
+script then starts no cluster, and that test is skipped. CI does this with a
 PostgreSQL service container.
 
 The master pipeline test
