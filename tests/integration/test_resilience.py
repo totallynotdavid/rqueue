@@ -11,11 +11,13 @@ import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC
+from typing import cast
 
 import asyncpg
 import pytest
 
 from rqueue import Job, Queue, TaskContext, Worker, migrations
+from rqueue.database_errors import DATABASE_ERRORS
 from rqueue.models import JobState
 
 from .support import eventually, running
@@ -373,6 +375,78 @@ async def test_a_database_restart_delays_work_but_loses_none(
     assert sorted(processed) == ["after", "before"]
 
 
+class _ReleaseFailsOnce:
+    """A pool whose next `acquire()` block fails as it hands the connection back.
+
+    That is what asyncpg does when a backend is killed mid-operation: the reset
+    on release raises `InternalClientError`, replacing the connection error that
+    caused it. A real restart produces it only by timing, so the failure is
+    injected at the release and everything else runs against the real pool.
+    """
+
+    def __init__(self, pool: asyncpg.Pool) -> None:
+        self._pool = pool
+        self.armed = False
+
+    def acquire(self) -> object:
+        inner = self._pool.acquire()
+        if not self.armed:
+            return inner
+        self.armed = False
+        return _FailingRelease(inner)
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._pool, name)
+
+
+class _FailingRelease:
+    def __init__(self, inner: object) -> None:
+        self._inner = inner
+
+    def __await__(self) -> object:
+        return self._inner.__await__()  # type: ignore[attr-defined]
+
+    async def __aenter__(self) -> object:
+        return await self._inner.__aenter__()  # type: ignore[attr-defined]
+
+    async def __aexit__(self, *exc_info: object) -> None:
+        await self._inner.__aexit__(*exc_info)  # type: ignore[attr-defined]
+        raise asyncpg.InternalClientError(
+            "cannot switch to state 15; another operation (2) is in progress"
+        )
+
+
+async def test_a_worker_survives_a_pool_release_that_fails(
+    pool: asyncpg.Pool, queue_name: str
+) -> None:
+    flaky = _ReleaseFailsOnce(pool)
+    queue = Queue(cast("asyncpg.Pool", flaky), name=queue_name)
+    reader = Queue(pool, name=queue_name)
+    done = asyncio.Event()
+
+    async def work(payload: object, context: TaskContext) -> None:
+        done.set()
+
+    queue.register(name="work", handler=work)
+    worker = Worker(queue, worker_id="flaky-release", poll_interval=0.1)
+    async with running(worker):
+        flaky.armed = True
+        await eventually(
+            lambda: _fired(flaky), message="the worker never used the pool again"
+        )
+        async with pool.acquire() as connection, connection.transaction():
+            job = await reader.enqueue(connection, task="work")
+        await asyncio.wait_for(done.wait(), timeout=15)
+        await eventually(
+            lambda: _in_state(reader, job.id, JobState.SUCCEEDED),
+            message="the worker must keep serving after the failed release",
+        )
+
+
+async def _fired(pool: _ReleaseFailsOnce) -> bool:
+    return not pool.armed
+
+
 async def test_a_real_database_restart_delays_work_but_loses_none(
     queue: Queue, pool: asyncpg.Pool
 ) -> None:
@@ -444,7 +518,7 @@ async def _enqueue_with_retry(
         try:
             async with pool.acquire() as connection, connection.transaction():
                 return await queue.enqueue(connection, task="work", payload=payload)
-        except (asyncpg.PostgresError, asyncpg.InterfaceError, OSError) as exc:
+        except DATABASE_ERRORS as exc:
             last = exc
             await asyncio.sleep(0.25)
     raise AssertionError(f"the producer never reconnected: {last!r}")
@@ -487,5 +561,10 @@ async def _worker_seen(pool: asyncpg.Pool, queue: Queue) -> bool:
 
 
 async def _in_state(queue: Queue, job_id: uuid.UUID, expected: JobState) -> bool:
-    job = await queue.get_job(job_id)
+    # A poll that lands on a connection a restart just killed is a poll that
+    # has not seen the state yet, not a failed test.
+    try:
+        job = await queue.get_job(job_id)
+    except DATABASE_ERRORS:
+        return False
     return job is not None and job.state == expected

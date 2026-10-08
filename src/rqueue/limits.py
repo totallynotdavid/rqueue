@@ -144,9 +144,10 @@ def validate_name(value: str, *, kind: str, max_length: int) -> str:
 def validate_queue_target(value: str) -> str:
     """Validate a queue name, or the ``'*'`` wildcard meaning every queue.
 
-    Queue-wide administration (pause, resume) takes either. The wildcard is a
-    sentinel rather than a pattern: it matches every queue because the pause
-    predicate reads it that way, exactly as ``role_queue_grants`` does.
+    Every operation that targets a queue by name takes either: pause, resume,
+    purge, stats and job listing. The wildcard is a sentinel rather than a
+    pattern: it matches every queue because the SQL predicates read it that
+    way, exactly as ``role_queue_grants`` does.
     """
     if value == QUEUE_WILDCARD:
         return value

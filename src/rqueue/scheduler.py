@@ -22,7 +22,7 @@ from typing import Any, Final
 import asyncpg
 
 from rqueue.cron import CronExpression, resolve_timezone
-from rqueue.database_errors import raise_if_permanent
+from rqueue.database_errors import DATABASE_ERRORS, raise_if_permanent
 from rqueue.errors import ValidationError
 from rqueue.limits import (
     MAX_CONCURRENCY_KEY_LENGTH,
@@ -43,8 +43,6 @@ from rqueue.queue import Queue
 __all__ = ["ScheduleSpec", "Scheduler"]
 
 _LOGGER: Final = logging.getLogger("rqueue.scheduler")
-
-_DB_ERRORS: Final = (asyncpg.PostgresError, asyncpg.InterfaceError, OSError)
 
 
 @dataclass(frozen=True, slots=True)
@@ -138,7 +136,7 @@ class Scheduler:
         while not self._stop.is_set():
             try:
                 await self.tick()
-            except _DB_ERRORS as exc:
+            except DATABASE_ERRORS as exc:
                 raise_if_permanent(exc)
                 self.logger.warning(
                     "rqueue: scheduler %s could not reach PostgreSQL; retrying",

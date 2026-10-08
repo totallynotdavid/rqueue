@@ -7,6 +7,7 @@ anywhere in this directory.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import uuid
 from collections.abc import AsyncIterator, Iterator
@@ -56,7 +57,13 @@ async def pool(admin_dsn: str) -> AsyncIterator[asyncpg.Pool]:
     try:
         yield created
     finally:
-        await created.close()
+        # `close` waits for every acquired connection to come back. A failed
+        # reset can leave a connection acquired, so an unbounded wait here
+        # hangs after the backend terminates it.
+        try:
+            await asyncio.wait_for(created.close(), timeout=15)
+        except TimeoutError:
+            created.terminate()
 
 
 @pytest.fixture

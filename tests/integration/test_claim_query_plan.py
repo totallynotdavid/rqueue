@@ -320,7 +320,7 @@ async def test_a_tie_group_at_the_boundary_does_not_defeat_the_cost_bound(
             # And the budget is still delivered in full out of that tie group,
             # which is the property the inclusive horizon is there for.
             deleted = await storage.purge(
-                connection, queue=None, older_than=older_than, limit=budget
+                connection, queue="*", older_than=older_than, limit=budget
             )
             assert deleted == budget, deleted
         finally:

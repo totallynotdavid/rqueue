@@ -13,7 +13,13 @@ from rqueue import Worker
 async def running(worker: Worker) -> AsyncIterator[Worker]:
     """Run a worker in the background for the duration of the block."""
     task = asyncio.create_task(worker.run(), name=f"worker-{worker.worker_id}")
-    await worker.wait_started()
+    started = asyncio.create_task(worker.wait_started())
+    # A worker that fails before it starts never sets the event, so waiting on
+    # the event alone would hang instead of raising its error.
+    await asyncio.wait({task, started}, return_when=asyncio.FIRST_COMPLETED)
+    started.cancel()
+    if task.done():
+        await task
     try:
         yield worker
     finally:

@@ -117,6 +117,8 @@ def test_purge_removes_old_terminal_jobs(
                     "--schema",
                     schema,
                     "purge",
+                    "--queue",
+                    "*",
                     "--retention-days",
                     "30",
                 ]
@@ -124,6 +126,40 @@ def test_purge_removes_old_terminal_jobs(
             == 0
         )
         assert "purged 1 job(s)" in capsys.readouterr().out
+    finally:
+        _drop_schema(admin_dsn, schema)
+
+
+def test_purge_needs_the_queue_written_out(
+    admin_dsn: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    schema = f"cli_{uuid.uuid4().hex[:10]}"
+    try:
+        assert main(["--database-url", admin_dsn, "--schema", schema, "migrate"]) == 0
+        capsys.readouterr()
+        _execute(
+            admin_dsn,
+            f"""
+            INSERT INTO {schema}.jobs
+                (queue, task, payload, state, max_attempts, finished_at)
+            VALUES ('q', 't', '{{}}'::jsonb, 'succeeded', 3, now() - interval '40 days')
+            """,
+        )
+        with pytest.raises(SystemExit) as raised:
+            main(
+                [
+                    "--database-url",
+                    admin_dsn,
+                    "--schema",
+                    schema,
+                    "purge",
+                    "--retention-days",
+                    "30",
+                ]
+            )
+        assert raised.value.code == 2
+        assert "--queue" in capsys.readouterr().err
+        assert _count(admin_dsn, schema) == 1
     finally:
         _drop_schema(admin_dsn, schema)
 
@@ -151,3 +187,16 @@ def _execute(dsn: str, statement: str) -> None:
 
 def _drop_schema(dsn: str, schema: str) -> None:
     _execute(dsn, f"DROP SCHEMA IF EXISTS {schema} CASCADE")
+
+
+def _count(dsn: str, schema: str) -> int:
+    import asyncio
+
+    async def run() -> int:
+        connection = await asyncpg.connect(dsn)
+        try:
+            return int(await connection.fetchval(f"SELECT count(*) FROM {schema}.jobs"))
+        finally:
+            await connection.close()
+
+    return asyncio.run(run())

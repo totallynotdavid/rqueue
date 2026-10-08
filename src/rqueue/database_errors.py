@@ -18,7 +18,18 @@ import asyncpg
 
 from rqueue.errors import ConfigurationError
 
-__all__ = ["is_permanent", "raise_if_permanent"]
+__all__ = ["DATABASE_ERRORS", "is_permanent", "raise_if_permanent"]
+
+#: What a failed tick can raise. ``InternalClientError`` is in the list because
+#: a pool whose connection is killed mid-operation raises it from the release
+#: ("another operation is in progress") instead of the connection error that
+#: caused it; it is the same outage, and the next tick gets a fresh connection.
+DATABASE_ERRORS: Final = (
+    asyncpg.PostgresError,
+    asyncpg.InterfaceError,
+    asyncpg.InternalClientError,
+    OSError,
+)
 
 _INSUFFICIENT_PRIVILEGE: Final = "42501"
 

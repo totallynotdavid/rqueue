@@ -77,9 +77,10 @@ async def purge_compute(pool) -> int:
 `pool` is an `asyncpg` pool connected as a role with `PURGE`. The call returns
 the number of deleted jobs.
 
-- Name a queue to purge that queue. Omit `queue` to purge every queue the caller
-  can see. `"*"`, which pause and resume accept, is not a queue name here and
-  raises `ValidationError`, as does any other invalid name.
+- `queue` is required. Name a queue to purge that queue, or pass `"*"` to purge
+  every queue the caller can see, as pause and resume do. `None` and any invalid
+  name raise `ValidationError`, so a delete across all queues is never reached
+  by leaving the argument out.
 - `limit` (default 10000, at most 100000) is one budget across all queues. The
   oldest jobs go first, whichever queue holds them. The call first tightens the
   cutoff to the age of the last job in the budget, including every job that

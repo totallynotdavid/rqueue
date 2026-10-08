@@ -3522,13 +3522,13 @@ async def test_a_purge_only_role_can_purge_through_admin(
         admin = Admin(purge_pool)
         assert await admin.purge(queue=queue_name, retention=timedelta(days=1)) == 2
 
-        # ... and without naming one, over every queue it holds. The other
+        # ... and with the wildcard, over every queue it holds. The other
         # queue is invisible to it, so nothing there is touched.
         for _ in range(2):
             await seed_terminal_job(
                 pool, queue=queue_name, state="succeeded", age=timedelta(days=30)
             )
-        assert await admin.purge(retention=timedelta(days=1)) == 2
+        assert await admin.purge(queue="*", retention=timedelta(days=1)) == 2
 
         # A typed error, not the driver's: the CLI only formats rqueue's own,
         # and "you are not granted that queue" is a configuration answer.
@@ -3665,7 +3665,7 @@ async def test_purge_reports_a_bad_argument_even_with_nothing_to_purge(
     future = timedelta(days=-1)
     # Both the fan-out and the single-queue path, since only the fan-out can
     # skip the routine entirely.
-    for target in (None, empty):
+    for target in ("*", empty):
         with pytest.raises(ValidationError):
             await admin.purge(queue=target, retention=day, states=["pending"])
         with pytest.raises(ValidationError):
@@ -3676,26 +3676,71 @@ async def test_purge_reports_a_bad_argument_even_with_nothing_to_purge(
     assert await admin.purge(queue=empty, retention=day) == 0
 
 
-async def test_the_purge_wildcard_is_a_name_that_does_not_exist(
-    pool: asyncpg.Pool, queue_name: str
+async def test_the_purge_wildcard_means_every_queue_and_nothing_else_does(
+    pool: asyncpg.Pool, purge_schema: str
 ) -> None:
-    """`'*'` means every queue to pause and resume, and nothing to purge.
+    """`'*'` purges every queue; leaving the queue out purges nothing.
 
-    Reaching for the sentinel that works on the neighbouring commands is the
-    obvious mistake, and `rqueue purge --queue '*'` has to answer it the way
-    every other bad queue name is answered. Unvalidated it reaches the routine,
-    whose own refusal arrives as an asyncpg error -- past the CLI's
-    `RqueueError` boundary, so the operator gets a traceback.
+    A delete across the schema has to be written out. `None` is refused rather
+    than read as "all", so a caller whose queue variable came back empty does
+    not wipe retention history, and the refusal is checked against rows that
+    would have gone.
     """
-    admin = Admin(pool)
+    admin = Admin(pool, schema=purge_schema)
     day = timedelta(days=1)
-    for bad in ("*", "", "has a space", "x" * (MAX_QUEUE_NAME_LENGTH + 1)):
-        with pytest.raises(ValidationError):
-            await admin.purge(queue=bad, retention=day)
+    for queue in ("a", "b"):
+        await seed_finished(
+            pool, schema=purge_schema, queue=queue, age=timedelta(days=5), count=2
+        )
 
-    # The queue that is not a name at all still means every queue.
-    assert await admin.purge(queue=None, retention=day) >= 0
-    assert await admin.purge(queue=queue_name, retention=day) == 0
+    for bad in (
+        None,
+        "",
+        "has a space",
+        "com*pute",
+        "x" * (MAX_QUEUE_NAME_LENGTH + 1),
+    ):
+        with pytest.raises(ValidationError):
+            await admin.purge(queue=bad, retention=day)  # type: ignore[arg-type]
+    with pytest.raises(TypeError):
+        await admin.purge(retention=day)  # type: ignore[call-arg]
+
+    async def remaining() -> int:
+        async with pool.acquire() as connection:
+            return int(
+                await connection.fetchval(f"SELECT count(*) FROM {purge_schema}.jobs")
+            )
+
+    assert await remaining() == 4
+
+    assert await admin.purge(queue="a", retention=day) == 2
+    assert await remaining() == 2
+    assert await admin.purge(queue="*", retention=day) == 2
+    assert await remaining() == 0
+    assert await admin.purge(queue="*", retention=day) == 0
+
+
+async def test_the_wildcard_reads_every_queue_in_stats_and_listings(
+    pool: asyncpg.Pool, purge_schema: str
+) -> None:
+    admin = Admin(pool, schema=purge_schema)
+    for queue, count in (("a", 2), ("b", 3)):
+        await seed_finished(
+            pool, schema=purge_schema, queue=queue, age=timedelta(days=5), count=count
+        )
+
+    assert (await admin.stats("a")).succeeded == 2
+    everything = await admin.stats("*")
+    assert everything.queue == "*"
+    assert everything.succeeded == 5
+
+    assert len(await admin.list_jobs(queue="a")) == 2
+    assert len(await admin.list_jobs(queue="*")) == 5
+    assert len(await admin.list_jobs()) == 5
+    with pytest.raises(ValidationError):
+        await admin.stats("com*pute")
+    with pytest.raises(ValidationError):
+        await admin.list_jobs(queue="com*pute")
 
 
 async def test_a_naive_purge_cutoff_is_refused_rather_than_guessed(
@@ -3711,7 +3756,7 @@ async def test_a_naive_purge_cutoff_is_refused_rather_than_guessed(
     """
     admin = Admin(pool)
     naive = datetime(2026, 9, 1)
-    for target in (None, queue_name):
+    for target in ("*", queue_name):
         with pytest.raises(ValidationError, match="timezone-aware"):
             await admin.purge(queue=target, retention=timedelta(days=1), now=naive)
 
@@ -3782,7 +3827,7 @@ async def test_a_bounded_purge_deletes_the_oldest_jobs_first(
 
     # The six oldest rows in the schema: one at 100 days, five at 50.
     admin = Admin(pool, schema=purge_schema)
-    assert await admin.purge(retention=timedelta(days=1), limit=6) == 6
+    assert await admin.purge(queue="*", retention=timedelta(days=1), limit=6) == 6
 
     async with pool.acquire() as connection:
         remaining = await connection.fetch(
@@ -3813,7 +3858,7 @@ async def test_a_bounded_purge_still_progresses_on_identically_aged_jobs(
         )
 
     admin = Admin(pool, schema=purge_schema)
-    assert await admin.purge(retention=timedelta(days=1), limit=3) == 3
+    assert await admin.purge(queue="*", retention=timedelta(days=1), limit=3) == 3
 
     async with pool.acquire() as connection:
         assert (
@@ -3912,7 +3957,10 @@ async def test_a_bounded_purge_takes_a_tie_group_that_straddles_the_budget(
             )
 
         admin = Admin(pool, schema=purge_schema)
-        assert await admin.purge(retention=timedelta(days=1), limit=limit) == limit
+        assert (
+            await admin.purge(queue="*", retention=timedelta(days=1), limit=limit)
+            == limit
+        )
         async with pool.acquire() as connection:
             assert (
                 await connection.fetchval(f"SELECT count(*) FROM {purge_schema}.jobs")
@@ -3950,7 +3998,7 @@ async def test_purge_paths_agree_on_identical_data(
                 """
             )
         removed = await admin.purge(
-            queue="q" if named else None, retention=timedelta(days=1), limit=150
+            queue="q" if named else "*", retention=timedelta(days=1), limit=150
         )
         assert removed == 150, "named" if named else "whole-schema"
 
@@ -3984,12 +4032,12 @@ async def test_a_purge_cutoff_is_judged_by_the_database_clock(
             with pytest.raises(ValidationError, match="cutoff in the past"):
                 await storage.purge(connection, queue="q", older_than=cutoff, limit=10)
             with pytest.raises(ValidationError, match="cutoff in the past"):
-                await storage.purge(connection, queue=None, older_than=cutoff, limit=10)
+                await storage.purge(connection, queue="*", older_than=cutoff, limit=10)
 
             # A cutoff the database agrees is past is accepted by both paths.
             past = frozen - timedelta(seconds=1)
             assert await storage.purge(connection, queue="q", older_than=past) == 0
-            assert await storage.purge(connection, queue=None, older_than=past) == 0
+            assert await storage.purge(connection, queue="*", older_than=past) == 0
         finally:
             await transaction.rollback()
 

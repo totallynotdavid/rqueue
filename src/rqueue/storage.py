@@ -34,11 +34,11 @@ from rqueue.errors import (
 )
 from rqueue.limits import (
     MAX_ERROR_MESSAGE_LENGTH,
-    MAX_QUEUE_NAME_LENGTH,
+    QUEUE_WILDCARD,
     truncate,
     validate_identifier,
-    validate_name,
     validate_purge_limit,
+    validate_queue_target,
 )
 from rqueue.models import (
     ACTIVE_STATES,
@@ -562,7 +562,7 @@ class Storage:
         self,
         connection: asyncpg.Connection,
         *,
-        queue: str | None,
+        queue: str,
         older_than: datetime,
         states: Sequence[str] = TERMINAL_STATES,
         limit: int = 10000,
@@ -576,7 +576,7 @@ class Storage:
         it has no ``DELETE`` on ``jobs`` and is not meant to.
 
         The routine takes one queue, because "every queue" is precisely the
-        unbounded delete it exists to refuse. ``queue=None`` therefore fans out
+        unbounded delete it exists to refuse. ``queue='*'`` therefore fans out
         over the queues that have something to purge -- but a fan-out is only
         oldest-first if something stops the first queue swallowing the budget,
         and visiting queues in age order is not that something. So the cutoff
@@ -599,24 +599,19 @@ class Storage:
         reach it, and an invalid cutoff or a live state would come back as a
         quiet ``0`` instead of an error.
 
-        The queue goes through :func:`~rqueue.limits.validate_name` rather than
-        :func:`~rqueue.limits.validate_queue_target`, so ``'*'`` is a name that
-        does not exist rather than the wildcard pause and resume accept. "Every
-        queue" is spelled ``queue=None`` here, and spelling it ``'*'`` has to
-        fail as the typed error every other bad name gives -- the routine's own
-        refusal arrives as a raw ``asyncpg`` exception, which is a traceback out
-        of ``rqueue purge --queue '*'`` rather than a message.
+        The queue goes through :func:`~rqueue.limits.validate_queue_target`, so
+        ``'*'`` means every queue here as it does everywhere else. It has to be
+        written out: ``None`` is refused, so a caller that forgot the argument
+        gets an error instead of a purge of the whole schema.
         """
         chosen = validate_purge_limit(limit)
         wanted = _validate_purge_states(states)
         older_than = await _validate_purge_cutoff(connection, older_than)
-        if queue is not None:
-            named = validate_name(
-                queue, kind="queue name", max_length=MAX_QUEUE_NAME_LENGTH
-            )
+        target = validate_queue_target(queue)
+        if target != QUEUE_WILDCARD:
             return await self._purge_one(
                 connection,
-                queue=named,
+                queue=target,
                 older_than=older_than,
                 states=wanted,
                 limit=chosen,
@@ -1250,7 +1245,7 @@ class _Statements:
         self.list_jobs = f"""
             SELECT {job_cols}
             FROM {jobs} AS j
-            WHERE ($1::text IS NULL OR j.queue = $1)
+            WHERE ($1::text IS NULL OR $1 = '*' OR j.queue = $1)
               AND ($2::text[] IS NULL OR j.state = ANY($2))
               AND ($3::text IS NULL OR j.task = $3)
             ORDER BY j.seq DESC
@@ -1282,7 +1277,7 @@ class _Statements:
                     WHERE state = 'leased' AND leased_until <= now()
                 )::int AS expired_leases
             FROM {jobs}
-            WHERE queue = $1
+            WHERE $1 = '*' OR queue = $1
         """
 
         self.distinct_active_tasks = f"""
@@ -1514,7 +1509,7 @@ class _Statements:
         self.live_instances = f"""
             SELECT DISTINCT instance FROM {beats}
             WHERE kind = $1 AND updated_at >= $2
-              AND ($3::text IS NULL OR queue = $3)
+              AND ($3::text IS NULL OR $3 = '*' OR queue = $3)
             ORDER BY instance
         """
 
