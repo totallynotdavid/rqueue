@@ -59,14 +59,20 @@ def _build_parser() -> argparse.ArgumentParser:
     readiness = subparsers.add_parser(
         "readiness", help="probe connectivity, schema version, and runtime liveness"
     )
-    readiness.add_argument("--queue", default=None)
+    readiness.add_argument(
+        "--queue", default=None, help="only this queue; '*' or omitted means all"
+    )
     readiness.add_argument("--require-scheduler", action="store_true")
     readiness.add_argument("--no-require-worker", action="store_true")
 
     purge = subparsers.add_parser(
         "purge", help="delete terminal jobs older than a retention window"
     )
-    purge.add_argument("--queue", default=None)
+    purge.add_argument(
+        "--queue",
+        required=True,
+        help="queue to purge, or '*' for every queue",
+    )
     purge.add_argument("--retention-days", type=float, required=True)
     purge.add_argument("--limit", type=int, default=10000)
 

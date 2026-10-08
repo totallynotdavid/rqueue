@@ -48,10 +48,15 @@ class Admin:
         limit: int = 100,
         offset: int = 0,
     ) -> list[Job]:
+        """List jobs, newest first.
+
+        ``queue`` filters to one queue; ``None`` and ``'*'`` both mean every
+        queue because listing does not mutate queue state.
+        """
         async with self.pool.acquire() as connection:
             return await self.storage.list_jobs(
                 connection,
-                queue=queue,
+                queue=None if queue is None else validate_queue_target(queue),
                 states=states,
                 task=task,
                 limit=limit,
@@ -64,8 +69,10 @@ class Admin:
             return await self.storage.attempts(connection, job_id)
 
     async def stats(self, queue: str) -> QueueStats:
+        """Counts for one queue, or summed over every queue for ``'*'``."""
+        target = validate_queue_target(queue)
         async with self.pool.acquire() as connection:
-            return await self.storage.stats(connection, queue=queue)
+            return await self.storage.stats(connection, queue=target)
 
     # --------------------------------------------------------- state changes
 
@@ -107,13 +114,18 @@ class Admin:
     async def purge(
         self,
         *,
-        queue: str | None = None,
+        queue: str,
         retention: timedelta,
         states: Sequence[JobState | str] | None = None,
         limit: int = 10000,
         now: datetime | None = None,
     ) -> int:
         """Delete terminal jobs that finished longer ago than ``retention``.
+
+        ``queue`` is required. A queue name purges that queue and ``'*'``
+        purges every queue, as it does for pause, resume and role grants.
+        ``None`` raises :class:`~rqueue.ValidationError`: a delete across the
+        schema has to be written out, not reached by leaving an argument off.
 
         Attempt records and occurrence rows are removed with their job by
         ``ON DELETE CASCADE``, so retention has one knob rather than three.
@@ -122,7 +134,7 @@ class Admin:
         re-derives every bound for itself, so this is the operation
         :attr:`~rqueue.Capability.PURGE` authorizes -- a role holding it has no
         ``DELETE`` on ``jobs`` and does not need one. Naming a queue is the
-        cheaper call; omitting it purges each queue that has anything to purge,
+        cheaper call; ``'*'`` purges each queue that has anything to purge,
         spending ``limit`` across them as a single budget.
 
         Only terminal states may be named. Asking for a live one raises rather
