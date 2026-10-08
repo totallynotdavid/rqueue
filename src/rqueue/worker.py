@@ -15,7 +15,7 @@ from typing import Any, Final
 import asyncpg
 
 from rqueue.context import TaskContext
-from rqueue.database_errors import raise_if_permanent
+from rqueue.database_errors import DATABASE_ERRORS, raise_if_permanent
 from rqueue.errors import (
     CancelJob,
     ConfigurationError,
@@ -51,8 +51,6 @@ _LOGGER: Final = logging.getLogger("rqueue.worker")
 #: reconnects through the pool and resumes, so a restart costs latency and
 #: never a job.
 _ERROR_BACKOFF_SECONDS: Final = 1.0
-
-_DB_ERRORS: Final = (asyncpg.PostgresError, asyncpg.InterfaceError, OSError)
 
 
 class Worker:
@@ -278,7 +276,7 @@ class Worker:
         while not self._stop.is_set():
             try:
                 claimed = await self._tick()
-            except _DB_ERRORS as exc:
+            except DATABASE_ERRORS as exc:
                 raise_if_permanent(exc)
                 self.logger.warning(
                     "rqueue: worker %s could not reach PostgreSQL; retrying",
@@ -433,7 +431,7 @@ class Worker:
 
         for entry in list(self._leases.values()):
             self._leases.pop(entry.job.id, None)
-            with contextlib.suppress(*_DB_ERRORS):
+            with contextlib.suppress(*DATABASE_ERRORS):
                 await self._safe_finalize(
                     self._retry_now(
                         entry.job,
@@ -674,7 +672,7 @@ class Worker:
                 lease_lost.set()
                 handler_task.cancel()
                 return
-            except _DB_ERRORS:
+            except DATABASE_ERRORS:
                 # A transient database problem must not cancel a healthy
                 # handler; the lease may well outlive the outage.
                 self.logger.warning(
