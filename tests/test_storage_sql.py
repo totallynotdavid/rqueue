@@ -222,3 +222,9 @@ def test_the_purge_horizon_is_bounded_by_the_budget() -> None:
     # `<`, so every row tied with the boundary would otherwise be dropped even
     # though it is inside the budget.
     assert "finished_at + interval '1 microsecond'" in horizon
+
+
+def test_every_queue_filter_reads_the_wildcard_the_same_way() -> None:
+    assert "$1 = '*' OR j.queue = $1" in statements()["list_jobs"]
+    assert "$1 = '*' OR queue = $1" in statements()["stats"]
+    assert "$3 = '*' OR queue = $3" in statements()["live_instances"]

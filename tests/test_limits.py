@@ -100,3 +100,10 @@ def test_error_text_is_truncated_not_rejected() -> None:
     assert truncated.endswith("...")
     assert truncate(None, 10) is None
     assert truncate("a\x00b", 10) == "ab"
+
+
+def test_the_wildcard_is_refused_as_a_name_but_not_as_a_target() -> None:
+    """Purge takes the target form, so '*' is every queue and None is an error."""
+    assert validate_queue_target("*") == QUEUE_WILDCARD
+    with pytest.raises(ValidationError):
+        validate_queue_target(None)  # type: ignore[arg-type]
