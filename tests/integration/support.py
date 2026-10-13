@@ -3,10 +3,58 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Awaitable, Callable
+import uuid
+from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from contextlib import asynccontextmanager
+from urllib.parse import urlsplit
+
+import asyncpg
 
 from rqueue import Worker
+from rqueue.roles import Capability, provision_role, revoke_role
+from scripts.database import database_target
+
+
+@asynccontextmanager
+async def scoped_role_pool(
+    admin_dsn: str,
+    *,
+    capabilities: Sequence[Capability],
+    queues: Sequence[str],
+    prefix: str = "rq_scoped",
+) -> AsyncIterator[asyncpg.Pool]:
+    """A pool logged in as a freshly provisioned role, dropped afterwards.
+
+    Python can assert grant shapes (see ``tests/test_roles.py``). A privilege
+    only really exists once PostgreSQL enforces it against a real
+    connection. Every claim about what a capability cannot do is made here by
+    trying it.
+    """
+    role = f"{prefix}_{uuid.uuid4().hex[:8]}"
+    password = "scoped-role-test-password"
+    database = urlsplit(admin_dsn).path.lstrip("/")
+    target = database_target(admin_dsn, database, user=role, password=password)
+
+    admin_connection = await asyncpg.connect(admin_dsn)
+    try:
+        await provision_role(
+            admin_connection,
+            role=role,
+            capabilities=capabilities,
+            queues=queues,
+            password=password,
+        )
+        pool = await asyncpg.create_pool(target.database_url, min_size=1, max_size=2)
+        assert pool is not None
+        try:
+            yield pool
+        finally:
+            await pool.close()
+    finally:
+        try:
+            await revoke_role(admin_connection, role=role, drop=True)
+        finally:
+            await admin_connection.close()
 
 
 @asynccontextmanager

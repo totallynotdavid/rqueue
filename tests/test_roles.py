@@ -18,22 +18,19 @@ from rqueue.roles import (
     _TABLE_GRANTS,
     PURGE_FUNCTION,
     Capability,
-    _drop_subsumed_column_privileges,
+    _resolve_privileges,
     provision_role,
 )
 
 
 def merged(*capabilities: Capability) -> dict[str, set[str]]:
     """The per-table privilege sets ``provision_role`` would grant."""
-    granted: dict[str, set[str]] = {}
+    granted: dict[str, list[str]] = {}
     for capability in capabilities:
         for table, privileges in _TABLE_GRANTS[capability]:
-            granted.setdefault(table, set()).update(
-                part.strip() for part in privileges.split(",")
-            )
+            granted.setdefault(table, []).append(privileges)
     return {
-        table: _drop_subsumed_column_privileges(allowed)
-        for table, allowed in granted.items()
+        table: set(_resolve_privileges(wanted)) for table, wanted in granted.items()
     }
 
 
@@ -46,25 +43,26 @@ def test_a_producer_may_only_touch_updated_at() -> None:
     }
 
 
-def test_a_whole_table_grant_subsumes_the_column_grant() -> None:
-    """PRODUCE + CONSUME must not emit UPDATE and UPDATE (updated_at) both."""
-    assert merged(Capability.PRODUCE, Capability.CONSUME)["jobs"] == {
+def test_column_lists_for_one_action_become_one_clause() -> None:
+    """PRODUCE + CONSUME must emit one UPDATE clause for ``jobs``."""
+    resolved = _resolve_privileges(
+        ["SELECT, INSERT, UPDATE (updated_at)", "SELECT, UPDATE (state, updated_at)"]
+    )
+    assert resolved == ["INSERT", "SELECT", "UPDATE (state, updated_at)"]
+
+
+def test_a_whole_table_grant_swallows_its_column_lists() -> None:
+    assert _resolve_privileges(["SELECT, UPDATE (updated_at)", "UPDATE"]) == [
         "SELECT",
-        "INSERT",
         "UPDATE",
-    }
+    ]
 
 
-def test_a_column_grant_survives_an_unrelated_whole_table_privilege() -> None:
-    assert _drop_subsumed_column_privileges(
-        {"SELECT", "INSERT", "UPDATE (updated_at)"}
-    ) == {"SELECT", "INSERT", "UPDATE (updated_at)"}
-
-
-def test_only_the_matching_action_is_subsumed() -> None:
-    assert _drop_subsumed_column_privileges(
-        {"SELECT", "SELECT (payload)", "UPDATE (updated_at)"}
-    ) == {"SELECT", "UPDATE (updated_at)"}
+def test_only_the_matching_action_is_swallowed() -> None:
+    assert _resolve_privileges(["SELECT, SELECT (payload), UPDATE (updated_at)"]) == [
+        "SELECT",
+        "UPDATE (updated_at)",
+    ]
 
 
 def test_a_worker_may_read_the_pause_table_but_not_write_it() -> None:
@@ -79,12 +77,16 @@ def test_a_consumer_cannot_enqueue() -> None:
     likes, under any payload -- the one privilege that turns a compromised
     worker into arbitrary execution across every replica.
     """
-    assert merged(Capability.CONSUME)["jobs"] == {"SELECT", "UPDATE"}
+    jobs = merged(Capability.CONSUME)["jobs"]
+    assert "INSERT" not in jobs
+    assert "UPDATE" not in jobs
 
 
 def test_a_role_that_needs_both_asks_for_both() -> None:
     """Dropping INSERT from CONSUME must not make the combination unusable."""
-    assert "INSERT" in merged(Capability.PRODUCE, Capability.CONSUME)["jobs"]
+    jobs = merged(Capability.PRODUCE, Capability.CONSUME)["jobs"]
+    assert "INSERT" in jobs
+    assert sum(privilege.startswith("UPDATE") for privilege in jobs) == 1
 
 
 def test_no_capability_grants_delete_on_jobs() -> None:
