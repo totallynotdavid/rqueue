@@ -229,15 +229,18 @@ async def _logged(caplog: pytest.LogCaptureFixture, text: str) -> bool:
     return any(text in record.getMessage() for record in caplog.records)
 
 
-async def test_wait_shutdown_waits_for_a_blocking_thread(
+BLOCKING_SECONDS = 3.0
+
+
+async def test_run_returns_within_the_grace_period_despite_a_blocking_thread(
     queue: Queue, pool: asyncpg.Pool
 ) -> None:
     started = asyncio.Event()
-    release = threading.Event()
     finished = threading.Event()
+    late_errors: list[object] = []
 
     def blocking_work() -> None:
-        release.wait()
+        time.sleep(BLOCKING_SECONDS)
         finished.set()
 
     async def work(payload: object, context: TaskContext) -> None:
@@ -248,32 +251,88 @@ async def test_wait_shutdown_waits_for_a_blocking_thread(
     async with pool.acquire() as connection, connection.transaction():
         job = await queue.enqueue(connection, task="work")
 
-    worker = Worker(
+    loop = asyncio.get_running_loop()
+    loop.set_exception_handler(lambda _loop, context: late_errors.append(context))
+    previous_hook = threading.excepthook
+    threading.excepthook = late_errors.append
+    try:
+        grace = 0.3
+        worker = Worker(
+            queue,
+            worker_id="blocking-shutdown",
+            poll_interval=0.05,
+            concurrency=1,
+            shutdown_timeout=grace,
+        )
+        run_task = asyncio.create_task(worker.run())
+        await worker.wait_started()
+        await asyncio.wait_for(started.wait(), timeout=15)
+
+        stopped_at = time.monotonic()
+        worker.stop()
+        await asyncio.wait_for(run_task, timeout=BLOCKING_SECONDS)
+        elapsed = time.monotonic() - stopped_at
+
+        assert elapsed < grace + 0.5, f"run() took {elapsed:.2f}s to return"
+        assert not finished.is_set(), "run() returned only after the thread did"
+        handed_back = await queue.get_job(job.id)
+        assert handed_back is not None
+        assert handed_back.state == JobState.PENDING
+        assert handed_back.error_type == "WorkerShutdown"
+        assert handed_back.lease_token is None
+        assert handed_back.leased_until is None
+
+        # The thread outlives run(). Let it return, then give the loop a turn
+        # to deliver anything it would have raised there.
+        await asyncio.to_thread(finished.wait, BLOCKING_SECONDS * 2)
+        assert finished.is_set()
+        await asyncio.sleep(0.1)
+        assert late_errors == []
+    finally:
+        threading.excepthook = previous_hook
+        loop.set_exception_handler(None)
+
+
+async def test_a_successor_claims_the_job_while_the_old_thread_still_runs(
+    queue: Queue, pool: asyncpg.Pool
+) -> None:
+    started = asyncio.Event()
+    release = threading.Event()
+    attempts: list[int] = []
+
+    async def work(payload: object, context: TaskContext) -> None:
+        attempts.append(context.attempt)
+        if len(attempts) == 1:
+            started.set()
+            await asyncio.to_thread(release.wait, BLOCKING_SECONDS)
+
+    queue.register(name="work", handler=work)
+    async with pool.acquire() as connection, connection.transaction():
+        job = await queue.enqueue(connection, task="work", max_attempts=3)
+
+    first = Worker(
         queue,
-        worker_id="wait-shutdown",
+        worker_id="first",
         poll_interval=0.05,
         concurrency=1,
-        shutdown_timeout=0.05,
+        shutdown_timeout=0.1,
     )
-    run_task = asyncio.create_task(worker.run())
-    await worker.wait_started()
+    run_task = asyncio.create_task(first.run())
+    await first.wait_started()
     await asyncio.wait_for(started.wait(), timeout=15)
-
-    release_timer = threading.Timer(0.25, release.set)
-    release_timer.start()
-    shutdown_started = time.monotonic()
     try:
-        await worker.shutdown(timeout=0.01)
+        await asyncio.wait_for(first.shutdown(), timeout=BLOCKING_SECONDS / 2)
+        await run_task
+
+        successor = Worker(queue, worker_id="second", poll_interval=0.05, concurrency=1)
+        await successor.drain(timeout=15)
     finally:
         release.set()
-        await asyncio.wait_for(run_task, timeout=15)
 
-    assert time.monotonic() - shutdown_started >= 0.15
-    assert finished.is_set()
-    handed_back = await queue.get_job(job.id)
-    assert handed_back is not None
-    assert handed_back.state == JobState.PENDING
-    assert handed_back.error_type == "WorkerShutdown"
+    finished = await queue.get_job(job.id)
+    assert finished is not None
+    assert finished.state == JobState.SUCCEEDED
+    assert len(attempts) == 2
 
 
 async def test_hard_cancellation_hands_claimed_work_to_a_successor(
