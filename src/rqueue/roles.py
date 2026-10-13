@@ -12,9 +12,11 @@ queue names a role may touch arrive as bind parameters, never as interpolated
 SQL.
 
 Two of the separations are enforced by what a capability is *not* given.
-:attr:`Capability.CONSUME` has no ``INSERT`` on ``jobs``: claiming and
-transitioning work is not the same authority as creating it, and a compromised
-worker that can enqueue can hand itself any task the fleet will run.
+:attr:`Capability.CONSUME` has no ``INSERT`` on ``jobs``, and its ``UPDATE`` is
+limited to the lease and outcome columns. Claiming and transitioning work is
+not the same authority as creating it. A compromised worker that can enqueue or
+rewrite a pending job's ``task`` and ``payload`` can hand itself any task the
+fleet will run.
 :attr:`Capability.PURGE` has no ``DELETE`` on ``jobs`` either -- it gets
 ``EXECUTE`` on the ``SECURITY DEFINER`` routine installed by migration 0006,
 which re-derives queue, terminal state, age cutoff, and batch size for itself.
@@ -33,7 +35,8 @@ only because the schema has already passed
 from __future__ import annotations
 
 import enum
-from collections.abc import Sequence
+import re
+from collections.abc import Iterable, Sequence
 from typing import TYPE_CHECKING, Final
 
 from rqueue.errors import ValidationError
@@ -79,11 +82,24 @@ _TABLE_GRANTS: dict[Capability, tuple[tuple[str, str], ...]] = {
         ("schema_migrations", "SELECT"),
     ),
     Capability.CONSUME: (
-        # No INSERT. A worker claims and transitions work; creating it is the
-        # producer's authority, and a role that holds both should say so by
-        # asking for both capabilities.
-        ("jobs", "SELECT, UPDATE"),
-        ("job_attempts", "SELECT, INSERT, UPDATE"),
+        # No INSERT. Creating work is the producer's authority. UPDATE covers
+        # only the columns the worker's statements write (lease, heartbeat,
+        # outcome, reschedule, ``retry_policy`` quarantine). Left out are what
+        # a job *is* (``task``, ``payload``, ``queue``, keys, limits) and the
+        # operator's ``cancel_requested``, so a worker cannot rewrite a pending
+        # job into different work.
+        (
+            "jobs",
+            "SELECT, UPDATE (state, attempt, scheduled_at, started_at, "
+            "finished_at, worker_id, lease_token, leased_until, heartbeat_at, "
+            "error_type, error_message, retry_policy, updated_at)",
+        ),
+        # Attempts are opened at claim and closed at the transition. The
+        # identifying columns are written once, by the INSERT.
+        (
+            "job_attempts",
+            "SELECT, INSERT, UPDATE (finished_at, outcome, error_type, error_message)",
+        ),
         ("concurrency_slots", "SELECT, INSERT, UPDATE, DELETE"),
         ("runtime_heartbeats", "SELECT, INSERT, UPDATE"),
         # The claim query reads the pause table on every claim. SELECT only:
@@ -174,20 +190,36 @@ _ELEVATED_ATTRIBUTES: Final = (
 )
 
 
-def _drop_subsumed_column_privileges(privileges: set[str]) -> set[str]:
-    """Drop column-scoped privileges a whole-table grant already covers.
+_PRIVILEGE: Final = re.compile(r"([A-Z]+)\s*(?:\(([^)]*)\))?")
 
+
+def _resolve_privileges(grants: Iterable[str]) -> list[str]:
+    """Merge the privilege lists of several capabilities for one table.
+
+    Each entry is a ``GRANT`` privilege list such as
+    ``"SELECT, UPDATE (a, b)"``.
     Capabilities are merged per table, so a role holding both PRODUCE and
-    CONSUME collects ``UPDATE (updated_at)`` from one and a whole-table
-    ``UPDATE`` from the other. Emitting both in one ``GRANT`` is redundant --
-    the table-wide privilege subsumes the column list -- so the narrower entry
-    is resolved away here rather than left for PostgreSQL to absorb silently.
+    CONSUME collects ``UPDATE (updated_at)`` from one and a list of columns
+    from the other. Column lists for one action are united into a single
+    clause, and an action granted on the whole table swallows its column lists,
+    so the ``GRANT`` that results says each thing once.
     """
-    resolved = set(privileges)
-    for privilege in privileges:
-        action, separator, _ = privilege.partition("(")
-        if separator and action.strip() in privileges:
-            resolved.discard(privilege)
+    whole: set[str] = set()
+    columns: dict[str, set[str]] = {}
+    for grant in grants:
+        for action, listed in _PRIVILEGE.findall(grant):
+            if listed:
+                columns.setdefault(action, set()).update(
+                    column.strip() for column in listed.split(",")
+                )
+            else:
+                whole.add(action)
+    resolved = sorted(whole)
+    resolved.extend(
+        f"{action} ({', '.join(sorted(listed))})"
+        for action, listed in sorted(columns.items())
+        if action not in whole
+    )
     return resolved
 
 
@@ -531,17 +563,14 @@ async def provision_role(
             role,
         )
 
-        granted: dict[str, set[str]] = {}
+        granted: dict[str, list[str]] = {}
         for capability in resolved:
             for table, privileges in _TABLE_GRANTS[capability]:
-                granted.setdefault(table, set()).update(
-                    part.strip() for part in privileges.split(",")
-                )
-        for table, merged in sorted(granted.items()):
-            allowed = _drop_subsumed_column_privileges(merged)
+                granted.setdefault(table, []).append(privileges)
+        for table, wanted in sorted(granted.items()):
             await _ddl(
                 connection,
-                "GRANT " + ", ".join(sorted(allowed)) + " ON %I.%I TO %I",
+                "GRANT " + ", ".join(_resolve_privileges(wanted)) + " ON %I.%I TO %I",
                 schema,
                 table,
                 role,
