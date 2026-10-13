@@ -29,8 +29,12 @@ def bounded_default_executor(
 
     The previous default executor is put back on exit, so embedding a Worker in
     a larger application does not permanently reshape that application's loop.
-    Exit waits for running threads: Python cannot safely interrupt a thread, so
-    the only way to be rid of one is to let it return.
+    Exit does not wait for running threads. Python cannot interrupt a thread.
+    Waiting would hold the event loop and process for as long as the slowest
+    thread runs. Work still queued behind the pool is cancelled. A running
+    thread finishes in the background, but its result is dropped because the
+    asyncio future it would resolve is already cancelled. A handler that must
+    stop early polls a signal of its own.
     """
     loop = asyncio.get_running_loop()
     previous = getattr(loop, "_default_executor", None)
@@ -49,4 +53,4 @@ def bounded_default_executor(
             loop.set_default_executor(previous)
         else:
             loop._default_executor = previous  # type: ignore[attr-defined]
-        executor.shutdown(wait=True)
+        executor.shutdown(wait=False, cancel_futures=True)
