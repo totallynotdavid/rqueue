@@ -42,15 +42,22 @@ After you upgrade rqueue, run `provision_role` again for every role. See
 | Capability | Allows                                                                                 |
 | ---------- | -------------------------------------------------------------------------------------- |
 | `PRODUCE`  | enqueue and read jobs. `UPDATE` only on `updated_at`, for the enqueue conflict path    |
-| `CONSUME`  | claim, heartbeat, and finish jobs. It does not allow enqueueing                        |
+| `CONSUME`  | claim, heartbeat, and finish jobs. It does not allow enqueueing or redefining a job    |
 | `SCHEDULE` | read schedules and enqueue their occurrences. It does not allow changing a job's state |
 | `INSPECT`  | read everything and write nothing, including the liveness rows that readiness reads    |
 | `PURGE`    | delete terminal jobs through `purge_terminal_jobs()`, and only through it              |
 
 `CONSUME` has no `INSERT` on `jobs`. Claiming work and creating it are separate
 authorities, and a worker that can enqueue can give the fleet any task it likes.
-A process that does both, such as a worker that enqueues follow-up jobs, asks
-for `[Capability.PRODUCE, Capability.CONSUME]`.
+Its `UPDATE` on `jobs` is limited to the columns the worker writes: `state`,
+`attempt`, `scheduled_at`, `started_at`, `finished_at`, `worker_id`,
+`lease_token`, `leased_until`, `heartbeat_at`, `error_type`, `error_message`,
+`retry_policy`, and `updated_at`. A worker cannot change a job's `queue`,
+`task`, `payload`, `priority`, `max_attempts`, keys, `timeout_seconds`,
+`metadata`, or `cancel_requested`, so it cannot rewrite a pending job into
+different work. On `job_attempts` it may update only the columns that close an
+attempt. A process that does both, such as a worker that enqueues follow-up
+jobs, asks for `[Capability.PRODUCE, Capability.CONSUME]`.
 
 `PURGE` has no `DELETE` on `jobs` either. It gets `EXECUTE` on
 `task_queue.purge_terminal_jobs(queue, states, finished_before, max_rows)`, a
@@ -157,9 +164,14 @@ alter or drop the table. Reassign the object to the migration role first.
 It also repairs privileges outside the schema. It sets the role to
 `NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS NOREPLICATION NOINHERIT` and
 removes every role membership before it applies the capability grants. Running
-it on a role that someone made a superuser narrows that role. A connection that
-cannot clear an attribute the role holds raises, so you never get a partly
-narrowed role.
+it on a role that someone made a superuser narrows that role.
+
+PostgreSQL lets a connection clear only an attribute it holds itself. Clearing
+`CREATEDB` needs `CREATEDB`, even on a role that does not have it. So on an
+existing role the call names only the attributes the role currently holds, and
+the result is the same set. A migration role without `SUPERUSER` can therefore
+re-provision a clean role. If the role holds an attribute that the connection
+lacks, the call raises, so you never get a partly narrowed role.
 
 The call is one transaction. If it fails, the role stays as the call found it:
 absent if it did not exist, unchanged if it did. For example, granting `PURGE`
