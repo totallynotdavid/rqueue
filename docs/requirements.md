@@ -170,21 +170,21 @@ Behavior the API guarantees:
 - Attempt records are a separate table and are not updated after an attempt
   ends.
 - Each index is declared in its migration beside the query it serves.
-- `rqueue migrate` is the only command that changes the schema. It takes an
-  advisory lock. Migrations are forward-only, run in a transaction, and are
-  checksummed, so rqueue refuses an edited migration and a schema newer than the
-  package. The integration suite migrates an empty database and upgrades from
-  every shipped version.
+- `rqueue migrate` and `rqueue.migrations.migrate` are the only calls that
+  change the schema. They take an advisory lock. Migrations are forward-only,
+  run each migration in a transaction, and are checksummed, so rqueue refuses
+  an edited migration and a schema newer than the package. The integration
+  suite migrates an empty database and upgrades from every shipped version.
 - A migration that the previous release's running code cannot survive checks for
   that code and refuses to apply. Each such migration carries its own check
   because a migration body runs once. The check reads liveness from the table a
   running process writes on a timer. It sees a process only after that process
   has ticked, so the remaining gap is the drain window. See
   [Running processes](migrations.md#running-processes).
-- Retention deletes the oldest terminal jobs first across the whole schema, and
-  a purge reads work proportional to its limit, not to the backlog. Purging one
-  queue and purging `"*"` are the same operation and delete the same rows from
-  the same data. See [Purge](roles.md#purge).
+- Retention deletes terminal jobs, oldest first, and a purge reads work
+  proportional to its limit, not to the backlog. Purging a named queue deletes
+  that queue's oldest jobs. Purging `"*"` spends one limit across every queue,
+  oldest first. See [Purge](roles.md#purge).
 - A worker and a scheduler report metrics through a `MetricsSink`: queue depth,
   oldest ready job, claim latency, handler duration, outcomes, expired leases,
   and wake-ups. No metrics vendor is required. See
@@ -237,9 +237,9 @@ Behavior the API guarantees:
   occurrence key `(schedule_id, occurrence_at)` has no queue.
 - The capability grant table belongs to the release, not to the schema.
   `migrate` moves the schema, and a role's privileges move when `provision_role`
-  runs again. A migration repairs only what a privilege fingerprint proves, and
-  never removes a privilege. [Migrations](migrations.md#re-provision-roles)
-  lists what an un-reprovisioned role lacks.
+  runs again. A migration may add privileges but never removes them.
+  [Migrations](migrations.md#re-provision-roles) lists what an un-reprovisioned
+  role lacks.
 - A component asks for an optional privilege only when it needs it. A scheduler
   without `DELETE` on `runtime_heartbeats` keeps ticking and logs that it cannot
   retract.
@@ -251,9 +251,8 @@ Several processes write the same tables.
 actor that may cause each transition. The rules are:
 
 - Every transition is enforced in SQL, whatever a process believes.
-- No component writes another's row, and no operator writes liveness rows. A
-  heartbeat row records the role that wrote it, and a role may write, refresh,
-  or delete only its own.
+- No component writes another's row. A heartbeat row records the role that wrote
+  it, and a role may write, refresh, or delete only its own.
 - A role may claim only a liveness `kind` its capabilities entitle it to.
 - A scheduler retracts a heartbeat for a queue it stopped serving on the same
   tick. A process that dies cannot retract, so time makes its row stale.
@@ -295,8 +294,8 @@ Integration tests against real PostgreSQL prove these. Run them with
 ## 11. Development workflow
 
 - The fast suite needs no database. Integration tests carry the `integration`
-  marker and run on a disposable per-run database against a least-privilege
-  role.
+  marker and run on a disposable per-run database. The tests that check
+  least-privilege behavior connect as a scoped role.
 - PostgreSQL for development is a project-local cluster managed by `mise`. It
   does not use Docker.
 
