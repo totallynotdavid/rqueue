@@ -60,9 +60,10 @@ class Worker:
     claiming, heartbeating, and finalizing each borrow a pooled connection for
     the duration of one short statement and give it straight back.
 
-    After in-flight leases are handed back, shutdown waits for any blocking
-    work submitted with ``asyncio.to_thread`` to finish. Python cannot stop a
-    running thread, so a thread that never returns keeps shutdown waiting.
+    Shutdown does not wait for blocking work submitted with
+    ``asyncio.to_thread``. Once in-flight leases are handed back, :meth:`run`
+    returns and the thread finishes in the background. Python cannot stop a
+    running thread, so a handler that should stop early polls its own signal.
     """
 
     def __init__(

@@ -44,9 +44,11 @@ worker can claim the jobs.
 `Worker.drain()` runs until the queue has no claimable work left. Use it for
 one-shot batch jobs and tests.
 
-Shutdown also waits for any handler that is still inside `asyncio.to_thread`,
-because Python cannot stop a running thread. A blocking handler therefore has to
-return on its own; keep it short or give it its own timeout.
+A handler that is inside `asyncio.to_thread` does not delay `run()`. The
+cancelled handler gives up its `await`, the worker hands the lease back, and
+`run()` returns within `shutdown_timeout`. See
+[Stopping blocking work](#stopping-blocking-work) for what happens to the
+thread.
 
 ## Database errors
 
@@ -82,5 +84,42 @@ A bare `asyncio.to_thread(...)` is therefore limited to the worker's capacity.
 Set `executor_max_workers` to size the pool separately, or
 `install_default_executor=False` to leave the loop alone.
 
-Shutdown waits for these threads. Cancelling a handler does not make `run()`
-return while its thread still runs.
+### Stopping blocking work
+
+Python cannot kill a thread. When the executor exits at the end of `run()`, it
+does not wait for running threads and it cancels work still queued behind them.
+The worker has already given handlers `shutdown_timeout` seconds and handed
+their leases back, so another worker may claim a job while the old thread of
+that job still runs. A second wait would add time without making the thread
+stop.
+
+A thread that is still running when `run()` returns finishes in the background.
+Its result is dropped, because the `await` that wanted it was cancelled, and a
+late return or exception does not reach the loop.
+
+The interpreter still joins `ThreadPoolExecutor` threads when the process exits,
+so the process lives until they return. To end work early, the function in the
+thread has to watch a signal and return. Set the signal when the handler is
+cancelled:
+
+```python
+import asyncio
+import threading
+
+from rqueue import Queue
+
+
+def register_render(queue: Queue) -> None:
+    @queue.task(name="render")
+    async def render(payload, context):
+        stop = threading.Event()
+        try:
+            await asyncio.to_thread(render_frames, payload["scene"], stop)
+        finally:
+            stop.set()
+```
+
+`render_frames` stands for your own function. It checks `stop.is_set()` between
+units of work and returns when it is set. Make a retried attempt safe to run
+while the previous thread is still winding down: write to a location that the
+attempt owns, or make the work idempotent.

@@ -191,13 +191,10 @@ await worker.run()
 - `Worker.stop()` requests a graceful stop. `await worker.shutdown()` is the
   awaitable lifecycle operation for a worker running in a background task. Its
   `timeout` bounds the in-flight handler grace period.
-- `executor_shutdown="wait"` is the safe default. After handing leases back,
-  the worker waits for blocking work submitted through `asyncio.to_thread`.
-  `executor_shutdown="detach"` returns without waiting for a still-running
-  thread, but does not interrupt it. A process using detach must be terminated
-  by its supervisor afterward and must not reuse the detached executor or start
-  new work in that process. `shutdown(wait_for_blocking_threads=...)` may
-  explicitly override the mode for one shutdown.
+- After handing leases back, the worker does not wait for blocking work
+  submitted through `asyncio.to_thread`. `run()` returns and the thread
+  finishes in the background. See `worker.md` for how a handler stops its
+  thread early.
 - Task registration is explicit and unique by task name. Worker startup fails
   if a queued task name has no registered handler, unless configured to leave
   it pending for a different worker deployment.

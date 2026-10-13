@@ -46,3 +46,58 @@ async def test_threads_carry_the_configured_name_prefix() -> None:
     with bounded_default_executor(1, thread_name_prefix="rqueue-test"):
         name = await asyncio.to_thread(lambda: threading.current_thread().name)
     assert name.startswith("rqueue-test")
+
+
+async def test_exit_does_not_wait_for_a_running_thread() -> None:
+    release = threading.Event()
+    started = threading.Event()
+
+    def block() -> None:
+        started.set()
+        release.wait(10)
+        raise RuntimeError("raised after the loop stopped waiting")
+
+    loop = asyncio.get_running_loop()
+    try:
+        with bounded_default_executor(1):
+            blocked = asyncio.ensure_future(asyncio.to_thread(block))
+            while not started.is_set():
+                await asyncio.sleep(0.01)
+            blocked.cancel()
+            began = time.monotonic()
+        assert time.monotonic() - began < 1.0
+    finally:
+        release.set()
+    # The cancelled future must not report the thread's late exception.
+    errors: list[object] = []
+    loop.set_exception_handler(lambda _loop, context: errors.append(context))
+    try:
+        await asyncio.sleep(0.1)
+    finally:
+        loop.set_exception_handler(None)
+    assert errors == []
+
+
+async def test_exit_cancels_work_still_queued_behind_the_pool() -> None:
+    release = threading.Event()
+    started = threading.Event()
+    ran_queued = threading.Event()
+
+    def block() -> None:
+        started.set()
+        release.wait(10)
+
+    try:
+        with bounded_default_executor(1):
+            first = asyncio.ensure_future(asyncio.to_thread(block))
+            while not started.is_set():
+                await asyncio.sleep(0.01)
+            queued = asyncio.ensure_future(asyncio.to_thread(ran_queued.set))
+            await asyncio.sleep(0.05)
+        release.set()
+        await asyncio.sleep(0.1)
+        assert queued.cancelled()
+        assert not ran_queued.is_set()
+        first.cancel()
+    finally:
+        release.set()
