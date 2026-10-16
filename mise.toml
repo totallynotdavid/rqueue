@@ -26,9 +26,6 @@ test-integration = "bash scripts/integration.sh"
 
 test-pipeline = "bash scripts/integration.sh tests/integration/test_master_pipeline.py"
 
-db = "mise run db:start"
-db-migrate = "mise run db:migrate"
-
 doctor = [
   "uv run python --version",
   "uv --version",
