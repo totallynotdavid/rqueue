@@ -70,6 +70,14 @@ new id, `state=pending`, and local timestamps.
 To test any of that, write an integration test against PostgreSQL. See
 [contributing](../.github/contributing.md#checks).
 
+## Options
+
+`RecordingQueue` rejects an enqueue for a task name it has neither declared nor
+registered. Pass `require_registered_tasks=False` when your code produces for a
+task whose handler lives in another deployment.
+
+It has no pool. `get_job`, `list_jobs` and `stats` raise `ConfigurationError`.
+
 ## Read the recording
 
 `RecordingQueue.recorded` lists every `RecordedEnqueue`. Each has the original
