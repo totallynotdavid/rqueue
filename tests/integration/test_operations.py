@@ -28,7 +28,7 @@ from rqueue import (
     migrations,
 )
 from rqueue.errors import ConfigurationError, ValidationError
-from rqueue.limits import MAX_QUEUE_NAME_LENGTH, QUEUE_WILDCARD
+from rqueue.limits import MAX_PURGE_LIMIT, MAX_QUEUE_NAME_LENGTH, QUEUE_WILDCARD
 from rqueue.models import JobState
 from rqueue.roles import Capability, grant_queues, provision_role, revoke_role
 from rqueue.storage import JobInsert, Storage
@@ -97,13 +97,7 @@ async def scratch_schema(admin_dsn: str) -> object:
 async def test_migrating_an_empty_database_installs_everything(
     scratch_schema: tuple[asyncpg.Connection, str],
 ) -> None:
-    """Every packaged migration, in order, and the tables they add up to.
-
-    The names are derived rather than transcribed. A second copy of the list
-    here only ever caught "a migration was added", which is not a defect, and
-    the ordered names are already pinned against a place a reader can check
-    them: the migrate transcript in docs/migrations.md.
-    """
+    """Every packaged migration, in order, and the tables they add up to."""
     connection, schema = scratch_schema
     applied = await migrations.migrate(connection, schema=schema)
     assert [m.name for m in applied] == [m.name for m in migrations.load_migrations()]
@@ -139,6 +133,27 @@ async def test_migrating_is_idempotent(
     connection, schema = scratch_schema
     await migrations.migrate(connection, schema=schema)
     assert await migrations.migrate(connection, schema=schema) == ()
+
+
+async def test_concurrent_migrations_apply_each_migration_once(
+    admin_dsn: str,
+) -> None:
+    schema = f"mig_race_{uuid.uuid4().hex[:8]}"
+    connections = [await asyncpg.connect(admin_dsn) for _ in range(4)]
+    try:
+        runs = await asyncio.gather(
+            *(migrations.migrate(c, schema=schema) for c in connections)
+        )
+        assert sorted(len(applied) for applied in runs) == [
+            0,
+            0,
+            0,
+            len(migrations.load_migrations()),
+        ]
+    finally:
+        await connections[0].execute(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
+        for connection in connections:
+            await connection.close()
 
 
 async def seed_for_upgrade(
@@ -210,19 +225,10 @@ async def seed_for_upgrade(
 async def test_upgrading_from_any_shipped_version_matches_a_fresh_install(
     admin_dsn: str, start: int
 ) -> None:
-    """Migrations are tested from empty *and* from what is already out there.
+    """An upgrade from every version, including 0, ends in the fresh schema.
 
-    Every version, not `latest - 1`. A release that ships one migration makes
-    those the same thing, and this test used to say so -- which held right up
-    until a release shipped three, at which point `latest - 1` named one of the
-    *new* migrations and the only upgrade under test was the internal step
-    between two files landing together. The version an operator is actually
-    upgrading from is whichever one their last deploy left them on, and no
-    expression over the packaged set knows which that is.
-
-    So the parametrization covers all of them, including 0 (a fresh install, by
-    a different route than the one below it) and the genuinely old versions
-    where a multi-migration span has to compose.
+    An operator upgrades from whichever version their last deploy left, so the
+    parametrization covers each one and the multi-migration spans compose.
     """
     stepwise = f"mig_step_{uuid.uuid4().hex[:8]}"
     fresh = f"mig_fresh_{uuid.uuid4().hex[:8]}"
@@ -246,7 +252,6 @@ async def test_upgrading_from_any_shipped_version_matches_a_fresh_install(
         assert await structure(connection, stepwise) == await structure(
             connection, fresh
         )
-        # The row written under the older version survived the upgrade.
         expected = 1 if start else 0
         assert (
             await connection.fetchval(f"SELECT count(*) FROM {stepwise}.jobs")
@@ -806,12 +811,7 @@ async def test_a_produce_only_role_cannot_rewrite_a_job(
 async def test_a_consume_only_role_cannot_enqueue(
     admin_dsn: str, pool: asyncpg.Pool, queue_name: str
 ) -> None:
-    """A worker claims and transitions work; it does not create work.
-
-    The grant shape is asserted without a database in ``tests/test_roles.py``;
-    this is the half that proves PostgreSQL agrees, because a stray
-    ``GRANT INSERT`` from anywhere else would leave that unit test green.
-    """
+    """A worker claims and transitions work; it does not create work."""
     async with scoped_role_pool(
         admin_dsn,
         capabilities=[Capability.CONSUME],
@@ -1168,9 +1168,7 @@ async def test_a_role_from_the_previous_release_still_beats_after_0008(
 
         worker = await asyncpg.connect(target.database_url)
         try:
-            # The write that used to fail with "permission denied for table
-            # role_runtime_kinds", on a role holding exactly what the previous
-            # release gave it.
+            # Existing role grants still permit heartbeat writes after migration.
             await worker.execute(beat.format(schema=schema))
             assert (
                 await worker.fetchval(
@@ -2866,18 +2864,14 @@ async def test_a_scheduler_without_delete_ticks_instead_of_looping(
 ) -> None:
     """A migration cannot re-grant anything to a role that already exists.
 
-    `DELETE` on `runtime_heartbeats` joined the SCHEDULE grant set with 0008,
-    and every scheduler role provisioned before that keeps the old one until an
-    operator re-provisions it. A retraction issued unconditionally would then
-    fail on *every* tick -- which `run()` retries at its interval, forever --
-    over a row the scheduler had no reason to touch, on deployments where
-    nothing ever changes.
+    A scheduler role provisioned before `DELETE` joined the SCHEDULE grant set
+    keeps the old set until an operator re-provisions it. A retraction issued
+    unconditionally would then fail on every tick, over a row the scheduler had
+    no reason to touch.
 
     So the retraction is asked for only when there is something to retract, and
     when it is refused the claim is left to go stale rather than the tick to
-    fail. Scheduling is the scheduler's job; a missing grant is not a reason to
-    stop doing it, and the staleness window is exactly the behaviour from
-    before retraction existed.
+    fail.
     """
     dropped = f"{queue_name}_dropped"
     kept = f"{queue_name}_kept"
@@ -3142,8 +3136,7 @@ async def test_0005_refuses_to_run_under_a_live_previous_release_worker(
         applied = await migrations.migrate(connection, schema=schema)
         assert "queue_scoped_runtime" in [m.name for m in applied]
 
-        # Past the transition the old statement is dead, as documented, and the
-        # new one -- the shape this release ships -- works.
+        # The statement that names no queue is rejected, as documented.
         with pytest.raises(asyncpg.InvalidColumnReferenceError):
             await connection.execute(old_heartbeat, "worker", "w1", "alpha", "{}")
         storage = Storage(schema)
@@ -3647,6 +3640,16 @@ async def test_purge_reports_a_bad_argument_even_with_nothing_to_purge(
     assert await admin.purge(queue=empty, retention=day) == 0
 
 
+async def test_the_routine_accepts_the_largest_limit_the_client_does(
+    pool: asyncpg.Pool, queue_name: str
+) -> None:
+    admin = Admin(pool)
+    purged = await admin.purge(
+        queue=queue_name, retention=timedelta(days=1), limit=MAX_PURGE_LIMIT
+    )
+    assert purged == 0
+
+
 async def test_the_purge_wildcard_means_every_queue_and_nothing_else_does(
     pool: asyncpg.Pool, purge_schema: str
 ) -> None:
@@ -3779,12 +3782,9 @@ async def test_a_bounded_purge_deletes_the_oldest_jobs_first(
 ) -> None:
     """Retention is oldest-first, across queues as well as within one.
 
-    A single DELETE ordered by finished_at gave that for free. It is the case
-    below that a fan-out gets wrong: one queue holding both the oldest row in
-    the schema *and* enough newer ones to exhaust the budget. Visiting queues
-    in age order is not enough -- the first queue is entered oldest-first and
-    then drained, so its two-day-old rows go while another queue's fifty-day-old
-    ones stay. Only a cutoff derived from the budget keeps the invariant.
+    One queue holds both the oldest row in the schema and enough newer ones to
+    exhaust the budget. Draining queues one at a time in age order would delete
+    its two-day-old rows while another queue's fifty-day-old ones stay.
     """
     mixed, old = "aaa", "zzz"
     assert mixed < old
@@ -3840,14 +3840,11 @@ async def test_a_bounded_purge_still_progresses_on_identically_aged_jobs(
 async def test_purging_needs_a_queue_grant_not_just_a_privilege(
     admin_dsn: str, pool: asyncpg.Pool, queue_name: str
 ) -> None:
-    """0006 changed who may purge, and docs/migrations.md says so.
+    """The purge routine authorizes the login role against `role_queue_grants`.
 
-    Retention used to be a plain DELETE, so any role holding that privilege
-    could run it. The routine authorizes the login role against
-    `role_queue_grants` instead -- which is what lets a PURGE role delete with
-    no DELETE grant, and what stops an operator identity that predates this
-    from purging until it is listed. Pinned here so the trade cannot be
-    reversed by accident, and so the documented remedy stays true.
+    That is what lets a PURGE role delete with no DELETE grant, and what stops
+    an operator identity that is not listed from purging, as docs/migrations.md
+    says.
     """
     role = f"rq_operator_{uuid.uuid4().hex[:8]}"
     password = "scoped-role-test-password"

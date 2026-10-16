@@ -202,8 +202,7 @@ async def test_a_bounded_purge_reads_the_budget_not_the_backlog(
                 PURGE_BACKLOG // 3,
             )
         # A tie group far larger than the budget, all of it newer than the
-        # backlog above. This is the shape that used to fall back to the
-        # caller's own cutoff and aggregate everything behind it.
+        # backlog above.
         await connection.execute(
             f"""
             INSERT INTO {JOBS_TABLE}

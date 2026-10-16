@@ -13,10 +13,8 @@ from urllib.parse import SplitResult, quote, urlsplit, urlunsplit
 
 import asyncpg
 
-# Names come from scripts/integration.sh, which builds them from a timestamp
-# and a pid -- but they are interpolated into DDL, so validate rather than
-# trust. asyncpg has no identifier-quoting helper; PostgreSQL's own
-# format('%I') does the quoting below.
+# Names are interpolated into DDL, so they are validated and quoted with
+# PostgreSQL's format('%I').
 _NAME_RE = re.compile(r"^[a-z_][a-z0-9_]*$")
 
 
@@ -96,7 +94,6 @@ async def drop_database(base_url: str, name: str, role: str | None) -> None:
     try:
         await _ddl(connection, "DROP DATABASE IF EXISTS %I WITH (FORCE)", target.name)
         if role:
-            # The database is gone, so nothing it owned can block the drop.
             await _ddl(connection, "DROP ROLE IF EXISTS %I", _check(role, "role name"))
     finally:
         await connection.close()

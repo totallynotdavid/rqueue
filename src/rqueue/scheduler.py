@@ -1,11 +1,8 @@
 """Periodic schedules, fired through the occurrence-key table.
 
-There is no leader election and no schedule-row claim. Each tick works out
-which occurrences are due, then tries to insert ``(schedule_id,
-occurrence_at)`` and the job it produces *in one transaction*. The unique
-constraint decides the winner between replicas, and a scheduler that dies
-mid-transaction leaves nothing behind, so the next tick retries the same
-occurrence. That is the whole mechanism.
+Each tick inserts ``(schedule_id, occurrence_at)`` and the job it produces in
+one transaction. The unique constraint picks the winner between replicas, so
+no leader election is needed.
 """
 
 from __future__ import annotations
@@ -86,11 +83,9 @@ class Scheduler:
     Safe to run on several replicas at once: they contend on the occurrence key
     and exactly one wins each occurrence.
 
-    A tick considers *every* enabled schedule in the schema, not only those
-    targeting this handle's queue -- a scheduler only enqueues, so one
-    deployment can serve several queues. The :class:`~rqueue.Queue` it is built
-    from supplies the pool, the schema, and the default queue for schedules
-    that do not name one.
+    A tick considers every enabled schedule in the schema, not only those
+    targeting this handle's queue. The :class:`~rqueue.Queue` supplies the pool,
+    the schema, and the default queue for schedules that name none.
     """
 
     def __init__(
@@ -114,20 +109,13 @@ class Scheduler:
         self.interval = float(interval)
         if catchup < 1:
             raise ValidationError("catchup must be at least 1")
-        #: How many missed occurrences one tick will fire after an outage. The
-        #: default of 1 collapses a long outage into a single catch-up run,
-        #: which is what a maintenance job almost always wants; raise it when
-        #: every individual occurrence genuinely matters.
+        #: How many missed occurrences one tick fires after an outage.
         self.catchup = catchup
         self.metrics: MetricsSink = metrics or NullMetricsSink()
         self.logger = logger or _LOGGER
         self._storage = queue.storage
         self._stop = asyncio.Event()
-        #: Queues this scheduler has already reported it cannot retract, so the
-        #: warning is not repeated on every tick. See `_report_unretractable`.
         self._unretractable: frozenset[str] = frozenset()
-
-    # ------------------------------------------------------------- lifecycle
 
     async def run(self) -> None:
         """Sync declared schedules, then fire due occurrences until stopped."""
@@ -172,38 +160,14 @@ class Scheduler:
                 )
         return stored
 
-    # ------------------------------------------------------------------ tick
-
     async def tick(self, *, now: datetime | None = None) -> list[Job]:
         """Fire every occurrence that is due, and return the jobs created.
 
-        ``now`` is injectable so a test can advance the clock instead of
-        waiting a real cron period; production leaves it unset.
+        ``now`` lets a test advance the clock.
 
-        The heartbeat is written per queue this tick actually serves, and for
-        no others. One scheduler deployment can serve several queues (see the
-        class docstring), so its liveness is a fact about each of them, and a
-        readiness probe for a queue this scheduler feeds has to find it.
-
-        A tick with nothing enabled to fire writes no heartbeat at all. There
-        is no queue to claim liveness for -- this handle's own queue is a
-        default for schedules that do not name one, not a queue this scheduler
-        is feeding -- and claiming it would be both untrue and, for a role not
-        granted that queue, an ``InsufficientPrivilegeError`` on every tick,
-        which would stop :meth:`run`. So a scheduler with no enabled
-        schedules reports as unavailable, because it is: nothing is scheduling
-        anything.
-
-        The heartbeats for queues this tick does *not* serve are dropped in the
-        same breath, which is what makes the two statements above one answer
-        rather than two. Disabling the last schedule on a queue is an ordinary
-        operator action taken against a scheduler that keeps running, so the
-        row it leaves behind is not a dead process's -- nothing will overwrite
-        it, and until the staleness window expires a readiness probe for that
-        queue answers "live, and this is the instance feeding it" about a
-        scheduler that is feeding it nothing. The window exists for a process
-        that died and cannot speak; a process that is still ticking says so
-        itself.
+        The heartbeat is written for each queue the enabled schedules target,
+        not this handle's own queue, and heartbeats for other queues are
+        dropped. With nothing enabled it writes none.
         """
         moment = now or datetime.now(UTC)
         created: list[Job] = []
@@ -224,27 +188,10 @@ class Scheduler:
     async def _reconcile_heartbeats(
         self, connection: asyncpg.Connection, serving: list[str]
     ) -> None:
-        """Claim the queues this tick serves, and retract the ones it does not.
+        """Claim the queues this tick serves, then retract the ones it does not.
 
-        One transaction, and the writes before the retraction: a readiness
-        probe landing mid-reconciliation must never see a queue this scheduler
-        still serves without a heartbeat.
-
-        The retraction is asked for only when there is something to retract,
-        which is what keeps it off the ordinary tick. It needs ``DELETE`` on
-        ``runtime_heartbeats``, and the ``SCHEDULE`` capability only started
-        granting that alongside 0008 -- a schema migration cannot re-grant
-        anything to a role that already exists, so a scheduler role provisioned
-        before it has the old grant set until an operator re-provisions it.
-        Issuing the statement unconditionally would fail such a role on *every*
-        tick, forever, over a row it had no reason to touch.
-
-        When it genuinely cannot retract, the claim is left to go stale rather
-        than the tick to fail: scheduling work is the scheduler's job and a
-        missing grant is not a reason to stop doing it. That is the behaviour
-        from before the retraction existed, so the cost is a readiness answer
-        that lags by the staleness window -- said once per distinct set, with
-        the remedy, instead of once per tick.
+        Writes come first, so a readiness probe never sees a served queue
+        without a heartbeat.
         """
         async with connection.transaction():
             for name in serving:
@@ -279,12 +226,7 @@ class Scheduler:
         self._unretractable = frozenset()
 
     def _report_unretractable(self, stale: list[str]) -> None:
-        """Say it once per distinct set, not once per tick.
-
-        The rows stay until something can delete them, so the condition does
-        not clear on its own and an unconditional log would repeat for as long
-        as the process runs.
-        """
+        """Say it once per distinct set, not once per tick."""
         if frozenset(stale) == self._unretractable:
             return
         self._unretractable = frozenset(stale)
@@ -335,10 +277,9 @@ class Scheduler:
     ) -> list[datetime]:
         """Occurrence instants that are due and not yet recorded, oldest first.
 
-        The lower bound is the last recorded occurrence, or -- for a schedule
-        that has never fired -- the moment the schedule row was created. Without
-        that anchor, deploying a new ``@daily`` schedule at noon would
-        immediately fire that morning's midnight run.
+        The lower bound is the last recorded occurrence, or the schedule's
+        creation time, so a new ``@daily`` schedule does not fire a run that
+        predates it.
         """
         cron = CronExpression.parse(schedule.cron)
         tz = resolve_timezone(schedule.timezone)
@@ -388,14 +329,6 @@ class Scheduler:
             fired_by=self.scheduler_id,
         )
 
-    # ------------------------------------------------------------ inspection
-
     async def occurrence_count(self, schedule_id: uuid.UUID) -> int:
         async with self.queue.pool.acquire() as connection:
             return await self._storage.occurrence_count(connection, schedule_id)
-
-    async def stored_schedules(self, *, enabled_only: bool = False) -> list[Schedule]:
-        async with self.queue.pool.acquire() as connection:
-            return await self._storage.list_schedules(
-                connection, enabled_only=enabled_only
-            )

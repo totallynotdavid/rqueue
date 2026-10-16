@@ -46,10 +46,7 @@ __all__ = ["Worker"]
 
 _LOGGER: Final = logging.getLogger("rqueue.worker")
 
-#: How long the loop waits after a database error before trying again. A
-#: PostgreSQL restart shows up here as a burst of connection errors; the worker
-#: reconnects through the pool and resumes, so a restart costs latency and
-#: never a job.
+#: How long the loop waits after a database error before trying again.
 _ERROR_BACKOFF_SECONDS: Final = 1.0
 
 
@@ -91,8 +88,7 @@ class Worker:
         self.concurrency = validate_concurrency(concurrency)
         self.batch_size = validate_batch_size(batch_size or self.concurrency)
         self.lease_duration = validate_lease_seconds(lease_duration)
-        # Three heartbeats per lease: one may be lost to a slow query or a GC
-        # pause without a healthy worker's lease lapsing.
+        # Three heartbeats per lease, so one can be lost without a lapse.
         self.heartbeat_interval = float(
             heartbeat_interval
             if heartbeat_interval is not None
@@ -118,14 +114,11 @@ class Worker:
         self._wake = asyncio.Event()
         self._running: dict[uuid.UUID, asyncio.Task[None]] = {}
         #: Leases this worker still owns. An entry survives its task only when
-        #: the task was cancelled from outside, which is how shutdown knows
-        #: which attempts still need handing back.
+        #: the task was cancelled from outside.
         self._leases: dict[uuid.UUID, ClaimedJob] = {}
         self._started = asyncio.Event()
         self._run_task: asyncio.Task[None] | None = None
         self._shutdown_timeout_override: float | None = None
-
-    # ------------------------------------------------------------- lifecycle
 
     async def run(self, *, until_idle: bool = False) -> None:
         """Serve the queue until :meth:`stop` is called.
@@ -236,9 +229,7 @@ class Worker:
     def _on_notify(
         self, connection: object, pid: int, channel: str, payload: str
     ) -> None:
-        # A job wake-up carries the queue it landed in; resuming the '*'
-        # wildcard carries the wildcard, since it concerns every queue. No real
-        # queue can be named '*' (rqueue.limits), so the two never collide.
+        # A wake-up carries its queue, or '*' for a wildcard resume.
         if payload not in (self.queue.name, QUEUE_WILDCARD):
             return
         self.metrics.counter("rqueue.wakeup", source="notify", queue=self.queue.name)
@@ -270,8 +261,6 @@ class Worker:
         if self.strict_tasks:
             raise UnknownTask(message)
         self.logger.warning("rqueue: %s (leaving them pending)", message)
-
-    # ------------------------------------------------------------- main loop
 
     async def _loop(self, *, until_idle: bool) -> None:
         while not self._stop.is_set():
@@ -339,9 +328,8 @@ class Worker:
                     lease_seconds=self.lease_duration,
                 )
             except asyncpg.DeadlockDetectedError:
-                # Two workers reached for the same pair of concurrency slots in
-                # opposite orders. PostgreSQL broke the tie; nothing was
-                # claimed, so the next poll simply tries again.
+                # Two workers took the same concurrency slots in opposite
+                # orders. Nothing was claimed.
                 self.logger.info(
                     "rqueue: claim deadlocked on concurrency slots; retrying"
                 )
@@ -412,8 +400,7 @@ class Worker:
         costs a round trip instead of a lease duration. If that write cannot be
         made, expiry recovery is still the backstop.
         """
-        # A hard `task.cancel()` on run() means "stop now", not "stop in
-        # shutdown_timeout seconds", so the grace period collapses.
+        # A hard `task.cancel()` on run() means "stop now", so no grace.
         current = asyncio.current_task()
         configured_grace = (
             self.shutdown_timeout
@@ -442,8 +429,6 @@ class Worker:
                     )
                 )
 
-    # ---------------------------------------------------------------- runner
-
     async def _execute(self, claimed: ClaimedJob) -> None:
         job = claimed.job
         token = claimed.lease_token
@@ -453,8 +438,7 @@ class Worker:
         try:
             registration = self.queue.get_task(job.task)
         except UnknownTask as exc:
-            # Only reachable if a handler is unregistered between the claim
-            # filter and here; fail durably rather than sit on the lease.
+            # Unregistered between the claim filter and here.
             await self._safe_finalize(
                 self._fail_terminal(job, token, "UnknownTask", str(exc))
             )
@@ -469,8 +453,7 @@ class Worker:
         try:
             payload = registration.decoder(job.payload)
         except Exception as exc:
-            # Decode failures are non-retryable and become a durable failed
-            # job. The same payload cannot become valid on a later attempt.
+            # A decode failure is not retryable: the payload does not change.
             self.logger.warning(
                 "rqueue: payload for job %s failed to decode", job.id, exc_info=True
             )
@@ -524,9 +507,8 @@ class Worker:
                         "rqueue.job.cancelled", queue=self.queue.name, task=job.task
                     )
                 else:
-                    # This worker's own task was cancelled -- a shutdown past
-                    # the grace period. Leave the lease in _leases so
-                    # _shutdown_inflight hands the attempt back.
+                    # Shutdown past the grace period. The lease stays in
+                    # _leases so _shutdown_inflight hands the attempt back.
                     handler_task.cancel()
                     handed_back = True
             except Exception as exc:
@@ -546,10 +528,7 @@ class Worker:
             if not handed_back:
                 self._leases.pop(job.id, None)
         if handed_back:
-            # Catching CancelledError above ran cleanup, but a caught
-            # CancelledError that is not re-raised lets this task complete
-            # normally. Re-raise so it still reports as cancelled to whatever
-            # is holding it, matching the cancellation _shutdown_inflight asked for.
+            # A caught CancelledError would let this task complete normally.
             raise asyncio.CancelledError
 
     async def _invoke(
@@ -563,9 +542,8 @@ class Worker:
         if timeout is None:
             await registration.handler(payload, context)
             return
-        # A timeout cancels the handler, but proves nothing about whether an
-        # external side effect already happened. The job retries under the
-        # normal policy. Handlers must be idempotent.
+        # A timeout proves nothing about side effects already made, so the job
+        # retries under the normal policy. Handlers must be idempotent.
         async with asyncio.timeout(timeout):
             await registration.handler(payload, context)
 
@@ -580,11 +558,8 @@ class Worker:
         will_retry = context.will_retry(exc)
         if isinstance(exc, Retry):
             if not will_retry:
-                # The budget is the job's, persisted at enqueue -- not the
-                # registration's default -- and it is spent. Terminating here
-                # is what `_retry_now` already does when shutdown hands a lease
-                # back with nothing left to hand it to; the alternative is a
-                # pending row no claim predicate will match.
+                # The job's budget is spent, and a pending row with no budget
+                # left matches no claim.
                 await self._safe_finalize(
                     self._fail_terminal(job, token, "Retry", _describe(exc))
                 )
@@ -639,8 +614,6 @@ class Worker:
         )
         self.metrics.counter("rqueue.job.retried", queue=self.queue.name, task=job.task)
 
-    # ------------------------------------------------------ lease bookkeeping
-
     async def _beat(
         self, job: Job, token: uuid.UUID, cancel_event: asyncio.Event
     ) -> bool:
@@ -668,14 +641,12 @@ class Worker:
             try:
                 requested = await self._beat(job, token, cancel_event)
             except LeaseLost:
-                # Another attempt owns this job now. Stop burning capacity on
-                # work whose result can no longer be written.
+                # Another attempt owns the job; this result cannot be written.
                 lease_lost.set()
                 handler_task.cancel()
                 return
             except DATABASE_ERRORS:
-                # A transient database problem must not cancel a healthy
-                # handler; the lease may well outlive the outage.
+                # An outage must not cancel a healthy handler.
                 self.logger.warning(
                     "rqueue: heartbeat for job %s failed; will retry",
                     job.id,
@@ -685,8 +656,6 @@ class Worker:
             if requested:
                 handler_task.cancel()
                 return
-
-    # ---------------------------------------------------------- finalization
 
     async def _succeed(self, job: Job, token: uuid.UUID) -> None:
         async with self.queue.pool.acquire() as connection:

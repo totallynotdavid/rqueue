@@ -118,7 +118,7 @@ def test_unknown_timezone_is_rejected() -> None:
 
 
 def test_dst_spring_forward_still_fires_once_a_day() -> None:
-    # Lima has no DST; use a zone that does. 2026-03-08 is the US change.
+    # The spring transition skips 02:30 in New York on 2026-03-08.
     tz = resolve_timezone("America/New_York")
     cron = CronExpression.parse("30 2 * * *")
     occurrences = cron.occurrences_between(
@@ -127,4 +127,4 @@ def test_dst_spring_forward_still_fires_once_a_day() -> None:
         tz=tz,
         limit=10,
     )
-    assert len(occurrences) == len(set(occurrences))
+    assert sorted(o.day for o in occurrences) == [6, 7, 8, 9, 10]

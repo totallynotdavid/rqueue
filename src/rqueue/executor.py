@@ -1,12 +1,8 @@
 """The bounded default executor the Worker installs.
 
-Handlers are async only. Blocking work goes through ``asyncio.to_thread``,
-which submits to the running loop's *default* executor -- and the default
-executor Python installs is unbounded in practice (``min(32, cpu_count + 4)``
-threads, chosen by the interpreter rather than by the deployment). Replacing it
-with one sized from the worker's ``concurrency`` means a bare
-``asyncio.to_thread(...)`` in a handler is capacity-limited without every task
-author constructing an executor of their own.
+``asyncio.to_thread`` uses the loop's default executor, which Python sizes at
+``min(32, cpu_count + 4)`` threads. The worker replaces it with one sized from
+its ``concurrency``.
 """
 
 from __future__ import annotations
@@ -45,10 +41,7 @@ def bounded_default_executor(
     try:
         yield executor
     finally:
-        # set_default_executor rejects None, and "no executor yet" is the
-        # normal starting state, so restoring goes through the attribute the
-        # loop actually reads. Assigning the previous value back is the only
-        # way to leave a host application's loop exactly as it was found.
+        # set_default_executor rejects None, which is the usual prior state.
         if isinstance(previous, ThreadPoolExecutor):
             loop.set_default_executor(previous)
         else:

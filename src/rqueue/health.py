@@ -1,9 +1,7 @@
 """Readiness checks that distinguish their failure modes.
 
-A single "ready: false" is useless during an incident. This reports
-PostgreSQL connectivity, migration version, worker availability, and scheduler
-availability separately, so a probe can tell "the database is down" from "the
-schema is behind" from "nobody is consuming this queue".
+Readiness reports PostgreSQL connectivity, migration version, worker
+availability, and scheduler availability separately.
 """
 
 from __future__ import annotations

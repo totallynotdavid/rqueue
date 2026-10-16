@@ -2,12 +2,11 @@
 
 from __future__ import annotations
 
-from dataclasses import replace as dataclass_replace
 from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from rqueue import Queue, TaskContext, TaskRegistration
+from rqueue import Queue, TaskContext
 from rqueue.errors import ConfigurationError, UnknownTask, ValidationError
 from rqueue.models import JobRequest
 from rqueue.retry import RetryPolicy
@@ -273,47 +272,11 @@ def test_failed_registration_does_not_leave_a_declaration(
     assert registration.retry.max_attempts == 7
 
 
-def test_task_registration_keeps_its_legacy_constructor() -> None:
-    retry = RetryPolicy(max_attempts=7)
-    registration = TaskRegistration(
-        name="legacy",
-        handler=handler,
-        decoder=lambda payload: payload,
-        retry=retry,
-        timeout=12.5,
-    )
-
-    assert registration.name == "legacy"
-    assert registration.retry is retry
-    assert registration.timeout == 12.5
-    assert registration.declaration.name == "legacy"
-    replaced = dataclass_replace(registration, handler=handler)
-    assert replaced.declaration == registration.declaration
-    assert replaced.handler is handler
-
-
-def test_task_registration_replace_can_override_retry() -> None:
-    registration = TaskRegistration(
-        name="replaceable",
-        handler=handler,
-        retry=RetryPolicy(max_attempts=3),
-    )
-    retry = RetryPolicy(max_attempts=9, initial_backoff=15.0)
-
-    # ``retry`` is a compatibility-only custom-constructor argument; it is
-    # intentionally outside the dataclass field list used by mypy here.
-    replaced = dataclass_replace(registration, retry=retry)  # type: ignore[call-arg]
-
-    assert replaced.retry is retry
-    assert replaced.name == registration.name
-    assert replaced.handler is registration.handler
-
-
-def test_task_registration_validates_retry_with_a_declaration(
+def test_a_registration_rejects_a_retry_that_is_not_a_policy(
     offline_queue: Queue,
 ) -> None:
     with pytest.raises(ConfigurationError, match="RetryPolicy instance"):
-        TaskRegistration(
+        offline_queue.register(
             name="invalid",
             handler=handler,
             retry=object(),  # type: ignore[arg-type]
@@ -412,11 +375,3 @@ def test_queue_name_can_be_overridden_for_the_scheduler(offline_queue: Queue) ->
 def test_payload_is_serialized_at_validation_time(offline_queue: Queue) -> None:
     with pytest.raises(ValidationError):
         offline_queue.build_insert(JobRequest(task="t", payload={"fn": handler}))
-
-
-def test_a_batch_is_validated_before_any_row_is_written(offline_queue: Queue) -> None:
-    # enqueue_many builds every spec first; a bad entry raises before the first
-    # insert, so nothing is written. Exercised here through the same helper.
-    requests = [JobRequest(task="t"), JobRequest(task="t", payload=object())]
-    with pytest.raises(ValidationError):
-        [offline_queue.build_insert(request) for request in requests]

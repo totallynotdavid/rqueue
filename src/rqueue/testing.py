@@ -1,62 +1,8 @@
 """A non-durable, recording stand-in for :class:`rqueue.Queue`, for unit tests.
 
-Deliberately **not** exported from the :mod:`rqueue` package. Import it by its
-full path::
-
-    from rqueue.testing import RecordingQueue
-
-so that "this is a test tool, not production wiring" is unambiguous from the
-import line alone.
-
-What it is for
---------------
-
-A consumer application wants to unit-test the seam where its business code
-asks for a job, such as a repository function that takes a ``defer`` callback,
-without starting PostgreSQL. Substituting a bare
-``AsyncMock`` proves only that *a* callback ran with *some* arguments.
-:class:`RecordingQueue` proves more: it runs the *real* validation path,
-:meth:`rqueue.Queue.build_insert`, which is a pure function with no database
-access, and then records the validated row instead of writing it.
-
-What a recorded call proves
----------------------------
-
-* The task name is well-formed and, unless ``require_registered_tasks=False``,
-  declared or registered -- so a typo is a test failure, not a runtime
-  surprise.
-* The payload is JSON-serializable and within :data:`rqueue.limits
-  .MAX_PAYLOAD_BYTES`; the same for ``metadata``.
-* ``dedupe_key`` is paired with an explicit ``on_conflict``, and
-  ``scheduled_at``/``delay`` are not both set.
-* ``priority``, ``max_attempts``, ``timeout``, and the two keys are within
-  their documented bounds, and the registered task's retry/timeout defaults
-  were applied.
-
-In short: the call is well-formed and the real queue would accept it.
-
-What it does **not** prove
---------------------------
-
-This is a recorder, not a simulator. It does not model:
-
-* PostgreSQL transactionality -- nothing is written, so nothing rolls back.
-  A recorded call inside a transaction that later aborts is still recorded.
-* Dedupe conflict resolution. Two calls sharing a ``dedupe_key`` are recorded
-  as two independent jobs; ``on_conflict="return_existing"`` never returns an
-  earlier job and ``on_conflict="raise"`` never raises
-  :class:`~rqueue.AlreadyEnqueued`.
-* Concurrency slots, claiming, leases, retries, state transitions, scheduling,
-  or ``NOTIFY``.
-
-Returned :class:`~rqueue.Job` values are synthesized locally: a fresh id,
-``state=JobState.PENDING``, ``attempt=0``, and local timestamps. They are a
-plausible return value for code that inspects what ``enqueue`` gave back (a
-job id to store alongside a business row, say), not a durable row.
-
-For any of the behaviour in that second list, use the real integration suite
-against real PostgreSQL -- ``tests/integration/`` here, and ``mise run
-test-integration`` to run it.
+It is not exported from :mod:`rqueue`. It runs the production validation in
+:meth:`rqueue.Queue.build_insert` and records the row instead of writing it. It
+does not simulate transactions, dedupe conflicts, claiming or leases.
 """
 
 from __future__ import annotations
@@ -91,8 +37,6 @@ class RecordedEnqueue:
     spec: JobInsert
     #: The synthesized job handed back to the caller.
     job: Job
-    #: Whatever was passed as the connection argument. Never used; recorded so
-    #: a test can assert its code enqueued on the connection it was given.
     connection: object = None
 
     @property
@@ -122,37 +66,7 @@ class RecordedEnqueue:
 
 
 class RecordingQueue(Queue):
-    """A :class:`~rqueue.Queue` that validates enqueue calls and records them.
-
-    It subclasses the real queue on purpose: call sites stay byte-identical
-    between test and production code, and a consumer function annotated
-    ``queue: Queue`` accepts one without an ``if TESTING:`` branch. Only the
-    persistence step is replaced -- validation still runs through
-    :meth:`~rqueue.Queue.build_insert`, and task registration
-    (:meth:`~rqueue.Queue.task`, :meth:`~rqueue.Queue.register`) is inherited
-    unchanged, so a test can declare the same enqueue metadata as a producer
-    or register the same task names the worker does.
-
-    There is no pool and no connection. The connection argument of
-    :meth:`enqueue` and :meth:`enqueue_many` is accepted, recorded, and
-    ignored, so the code under test can pass the connection it already has --
-    real, faked, or ``None``::
-
-        queue = RecordingQueue(name="compute")
-        queue.register(name="prepare_simulation", handler=prepare_simulation)
-
-        await create_or_get_job(data=..., simulation_id=..., defer=enqueue_simulation)
-
-        (recorded,) = queue.enqueued("prepare_simulation")
-        assert recorded.payload == {"compute_job_id": str(compute_job_id)}
-        assert recorded.dedupe_key == f"simulation:{compute_job_id}"
-
-    Read this module's docstring for what a recorded call does and does not
-    prove. The inspection and administration methods inherited from
-    :class:`~rqueue.Queue` (:meth:`~rqueue.Queue.get_job`,
-    :meth:`~rqueue.Queue.list_jobs`, :meth:`~rqueue.Queue.stats`) need a real
-    database and raise :class:`~rqueue.ConfigurationError` here.
-    """
+    """A :class:`~rqueue.Queue` that validates enqueue calls and records them."""
 
     def __init__(
         self,
@@ -162,14 +76,7 @@ class RecordingQueue(Queue):
         default_retry: RetryPolicy | None = None,
         require_registered_tasks: bool = True,
     ) -> None:
-        """Build a recording queue.
-
-        ``require_registered_tasks`` (default on) rejects an enqueue for a
-        task name this queue has neither declared nor registered, which is how
-        a typo'd name becomes a unit-test failure. Turn it off if the
-        application under test legitimately produces for a task whose
-        metadata and handler live in another deployment.
-        """
+        """Build a recording queue."""
         super().__init__(
             cast("asyncpg.Pool", None),
             name=name,
@@ -179,8 +86,6 @@ class RecordingQueue(Queue):
         self.require_registered_tasks = require_registered_tasks
         #: Every call recorded so far, in call order.
         self.recorded: list[RecordedEnqueue] = []
-
-    # -------------------------------------------------------------- enqueue
 
     async def enqueue(
         self,
@@ -224,11 +129,7 @@ class RecordingQueue(Queue):
         jobs: Sequence[JobRequest],
         /,
     ) -> list[Job]:
-        """Validate a whole batch, then record it -- or record none of it.
-
-        Production validates every entry before writing any row; this mirrors
-        that, so a bad entry at index 40 leaves nothing in :attr:`recorded`.
-        """
+        """Validate a whole batch, then record it, or record none of it."""
         if len(jobs) > MAX_ENQUEUE_BATCH:
             raise ValidationError(
                 f"enqueue_many accepts at most {MAX_ENQUEUE_BATCH} jobs per call "
@@ -240,8 +141,6 @@ class RecordingQueue(Queue):
             for request, spec in zip(jobs, specs, strict=True)
         ]
 
-    # ------------------------------------------------------------ assertions
-
     def enqueued(self, task: str | None = None) -> list[RecordedEnqueue]:
         """The recorded calls, optionally narrowed to one task name."""
         if task is None:
@@ -251,8 +150,6 @@ class RecordingQueue(Queue):
     def reset(self) -> None:
         """Forget every recorded call. Registered tasks are kept."""
         self.recorded.clear()
-
-    # ------------------------------------------------------------- internals
 
     def _validate(self, request: JobRequest) -> JobInsert:
         """Run the production validation path and the registry check."""
@@ -282,7 +179,6 @@ class RecordingQueue(Queue):
             priority=spec.priority,
             attempt=0,
             max_attempts=spec.max_attempts,
-            # The column defaults to now() when the request named no instant.
             scheduled_at=spec.scheduled_at or now,
             created_at=now,
             updated_at=now,
@@ -310,6 +206,5 @@ class RecordingQueue(Queue):
             "RecordingQueue.recorded instead, or write an integration test "
             "against real PostgreSQL."
         )
-        # Unreachable. It is what makes this an async generator, which
-        # @asynccontextmanager requires.
+        # Unreachable; @asynccontextmanager requires a generator.
         yield cast("asyncpg.Connection", None)

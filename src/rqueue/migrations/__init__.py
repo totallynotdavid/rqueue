@@ -1,9 +1,7 @@
-"""Forward-only migration runner (docs/requirements.md §7).
+"""Forward-only migration runner.
 
-Nothing here runs implicitly. The only entry points are
-``rqueue migrate`` (see :mod:`rqueue.cli`) and :func:`migrate`, which a test or
-a deployment script calls deliberately. Importing :mod:`rqueue` creates no
-schema and opens no connection.
+Nothing runs implicitly. The entry points are ``rqueue migrate`` and
+:func:`migrate`.
 """
 
 from __future__ import annotations
@@ -32,9 +30,8 @@ __all__ = [
 _FILENAME_RE: Final = re.compile(r"^(\d{4})_([a-z0-9_]+)\.sql$")
 _NO_TRANSACTION_MARKER: Final = "-- rqueue:no-transaction"
 
-#: `pg_advisory_lock` namespace for rqueue. The lock key is this value mixed
-#: with the target schema name, so migrating two schemas in one database does
-#: not serialize needlessly while two migrators of one schema do.
+#: `pg_advisory_lock` namespace, mixed with the schema name so that only
+#: migrators of the same schema serialize.
 _ADVISORY_LOCK_NAMESPACE: Final = 0x5251_5545  # "RQUE"
 
 
@@ -110,11 +107,7 @@ def _advisory_lock_key(schema: str) -> int:
 
 
 async def _bootstrap(connection: asyncpg.Connection, schema: str) -> None:
-    """Create the schema and the ledger this runner needs to make decisions.
-
-    This is the one place rqueue issues DDL outside a migration file, and it
-    only happens inside the explicit migrate command.
-    """
+    """Create the schema and the ledger, the only DDL outside a migration file."""
     await connection.execute(f"CREATE SCHEMA IF NOT EXISTS {schema}")
     await connection.execute(
         f"""

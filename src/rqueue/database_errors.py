@@ -20,10 +20,8 @@ from rqueue.errors import ConfigurationError
 
 __all__ = ["DATABASE_ERRORS", "is_permanent", "raise_if_permanent"]
 
-#: What a failed tick can raise. ``InternalClientError`` is in the list because
-#: a pool whose connection is killed mid-operation raises it from the release
-#: ("another operation is in progress") instead of the connection error that
-#: caused it; it is the same outage, and the next tick gets a fresh connection.
+#: ``InternalClientError`` is here because a pool whose connection is killed
+#: mid-operation raises it on release instead of the connection error.
 DATABASE_ERRORS: Final = (
     asyncpg.PostgresError,
     asyncpg.InterfaceError,

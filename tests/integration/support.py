@@ -23,13 +23,7 @@ async def scoped_role_pool(
     queues: Sequence[str],
     prefix: str = "rq_scoped",
 ) -> AsyncIterator[asyncpg.Pool]:
-    """A pool logged in as a freshly provisioned role, dropped afterwards.
-
-    Python can assert grant shapes (see ``tests/test_roles.py``). A privilege
-    only really exists once PostgreSQL enforces it against a real
-    connection. Every claim about what a capability cannot do is made here by
-    trying it.
-    """
+    """A pool logged in as a freshly provisioned role, dropped afterwards."""
     role = f"{prefix}_{uuid.uuid4().hex[:8]}"
     password = "scoped-role-test-password"
     database = urlsplit(admin_dsn).path.lstrip("/")

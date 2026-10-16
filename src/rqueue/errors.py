@@ -74,10 +74,6 @@ class LeaseLost(RqueueError):
     """
 
 
-class InvalidStateTransition(RqueueError):
-    """A job was not in a state that permits the requested transition."""
-
-
 class MigrationError(RqueueError):
     """The migration runner refused to apply or verify a migration."""
 

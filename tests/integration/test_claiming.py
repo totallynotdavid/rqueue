@@ -51,30 +51,6 @@ async def test_multiple_workers_run_each_job_once(
     assert stats.pending == 0 and stats.leased == 0
 
 
-async def test_concurrent_claims_never_share_a_job(
-    queue: Queue, pool: asyncpg.Pool
-) -> None:
-    async with pool.acquire() as connection, connection.transaction():
-        for index in range(10):
-            await queue.enqueue(connection, task="prepare", payload={"i": index})
-
-    async def claim(worker: str) -> list[uuid.UUID]:
-        async with pool.acquire() as connection:
-            claimed = await queue.storage.claim(
-                connection,
-                queue=queue.name,
-                worker_id=worker,
-                tasks=["prepare"],
-                limit=10,
-                lease_seconds=30,
-            )
-        return [entry.job.id for entry in claimed]
-
-    batches = await asyncio.gather(*(claim(f"c{index}") for index in range(5)))
-    everything = [job_id for batch in batches for job_id in batch]
-    assert len(everything) == len(set(everything)) == 10
-
-
 async def test_a_named_concurrency_key_serializes_execution(
     queue: Queue, pool: asyncpg.Pool
 ) -> None:

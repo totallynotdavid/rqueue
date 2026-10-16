@@ -63,10 +63,8 @@ class RetryPolicy:
                     self.max_backoff,
                 )
             except OverflowError:
-                # A finite multiplier can still overflow while raising it to
-                # the bounded exponent, or while converting a huge integer
-                # result for multiplication. The configured cap is the
-                # correct result once the uncapped exponential has exceeded it.
+                # A finite multiplier can still overflow. The cap is the right
+                # answer once the exponential has passed it.
                 delay = self.max_backoff
         if self.jitter:
             spread = delay * self.jitter
@@ -76,9 +74,7 @@ class RetryPolicy:
     def next_attempt_at(self, attempt: int, *, now: datetime | None = None) -> datetime:
         reference = now or datetime.now(UTC)
         delay = self.backoff_seconds(attempt)
-        # Bound the delay before constructing the timedelta. Using whole
-        # seconds avoids a float rounding step crossing datetime.max by one
-        # microsecond at the upper edge of the representable range.
+        # Whole seconds keep float rounding from crossing datetime.max.
         maximum = datetime.max.replace(tzinfo=reference.tzinfo) - reference
         maximum_seconds = maximum.days * 86_400 + maximum.seconds
         return reference + timedelta(seconds=min(delay, maximum_seconds))

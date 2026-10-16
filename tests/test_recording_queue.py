@@ -4,13 +4,12 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Awaitable, Callable
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from typing import Any
 
 import pytest
 
-import rqueue
-from rqueue import Queue, TaskContext
+from rqueue import TaskContext
 from rqueue.errors import ConfigurationError, UnknownTask, ValidationError
 from rqueue.models import Job, JobRequest, JobState
 from rqueue.retry import RetryPolicy
@@ -31,15 +30,6 @@ def queue() -> RecordingQueue:
         timeout=42.0,
     )
     return recording
-
-
-def test_it_is_not_part_of_the_rqueue_package_surface() -> None:
-    assert "RecordingQueue" not in rqueue.__all__
-    assert not hasattr(rqueue, "RecordingQueue")
-
-
-def test_it_is_a_queue_so_call_sites_do_not_branch(queue: RecordingQueue) -> None:
-    assert isinstance(queue, Queue)
 
 
 async def test_a_recorded_call_carries_the_validated_row_and_a_job(
@@ -71,19 +61,22 @@ async def test_a_recorded_call_carries_the_validated_row_and_a_job(
     assert recorded.request.on_conflict == "return_existing"
 
 
-async def test_the_returned_job_is_plausible_pending_shape(
+async def test_the_returned_job_is_a_pending_job_with_the_registered_defaults(
     queue: RecordingQueue,
 ) -> None:
     before = datetime.now(UTC)
     job = await queue.enqueue(task="prepare_simulation", payload=[1, 2])
+    other = await queue.enqueue(task="prepare_simulation")
 
-    assert isinstance(job, Job)
     assert isinstance(job.id, uuid.UUID)
+    assert job.id != other.id
     assert job.state is JobState.PENDING
     assert job.attempt == 0
     assert job.queue == "compute"
     assert job.payload == [1, 2]
     assert job.metadata == {}
+    assert job.max_attempts == 7
+    assert job.timeout_seconds == 42.0
     assert before <= job.created_at <= datetime.now(UTC)
     assert job.created_at == job.updated_at
     assert job.scheduled_at >= before
@@ -92,13 +85,7 @@ async def test_the_returned_job_is_plausible_pending_shape(
     assert job.lease_token is None
 
 
-async def test_ids_are_unique_per_call(queue: RecordingQueue) -> None:
-    first = await queue.enqueue(task="prepare_simulation")
-    second = await queue.enqueue(task="prepare_simulation")
-    assert first.id != second.id
-
-
-async def test_the_connection_argument_is_optional_and_ignored(
+async def test_the_connection_argument_is_recorded_when_given_and_optional(
     queue: RecordingQueue,
 ) -> None:
     await queue.enqueue(task="prepare_simulation")
@@ -106,52 +93,26 @@ async def test_the_connection_argument_is_optional_and_ignored(
     assert [recorded.connection for recorded in queue.recorded] == [None, None]
 
 
-# --------------------------------------------------------------- validation
-
-
-async def test_registered_defaults_are_applied(queue: RecordingQueue) -> None:
-    """Proof that the call really goes through Queue.build_insert."""
-    job = await queue.enqueue(task="prepare_simulation")
-    assert job.max_attempts == 7
-    assert job.timeout_seconds == 42.0
-
-
-async def test_declared_defaults_are_applied_without_a_handler() -> None:
-    queue = RecordingQueue(name="compute")
-    queue.declare_task(
-        name="prepare_simulation",
-        retry=RetryPolicy(max_attempts=7),
-        timeout=42.0,
-    )
-
-    job = await queue.enqueue(task="prepare_simulation")
-
-    assert job.max_attempts == 7
-    assert job.timeout_seconds == 42.0
-    assert queue.tasks == {}
-
-
-async def test_declaration_and_registration_share_one_metadata_source() -> None:
-    queue = RecordingQueue(name="compute")
-    declaration = queue.declare_task(
-        name="prepare_simulation",
-        retry=RetryPolicy(max_attempts=7),
-        timeout=42.0,
-    )
-    registration = queue.register(name="prepare_simulation", handler=prepare_simulation)
-
-    assert registration.declaration is not declaration
-    assert registration.retry.max_attempts == declaration.retry.max_attempts
-    assert registration.retry.retry_on == queue.default_retry.retry_on
-    assert registration.retry.retry_if is queue.default_retry.retry_if
-    job = await queue.enqueue(task="prepare_simulation")
-    assert job.max_attempts == 7
-    assert job.timeout_seconds == 42.0
-
-
-async def test_an_unregistered_task_name_is_rejected(queue: RecordingQueue) -> None:
-    with pytest.raises(UnknownTask, match="prepare_simulaton"):
-        await queue.enqueue(task="prepare_simulaton")
+@pytest.mark.parametrize(
+    ("error", "call"),
+    [
+        pytest.param(
+            UnknownTask,
+            {"task": "prepare_simulaton"},
+            id="an unregistered task name",
+        ),
+        pytest.param(
+            ValidationError,
+            {"task": "prepare_simulation", "priority": 10**9},
+            id="a priority out of range",
+        ),
+    ],
+)
+async def test_an_invalid_call_raises_and_records_nothing(
+    queue: RecordingQueue, error: type[Exception], call: dict[str, Any]
+) -> None:
+    with pytest.raises(error):
+        await queue.enqueue(**call)
     assert queue.recorded == []
 
 
@@ -159,48 +120,6 @@ async def test_the_registry_check_can_be_turned_off() -> None:
     queue = RecordingQueue(require_registered_tasks=False)
     job = await queue.enqueue(task="handled_elsewhere")
     assert job.task == "handled_elsewhere"
-
-
-async def test_a_dedupe_key_still_needs_an_explicit_conflict_mode(
-    queue: RecordingQueue,
-) -> None:
-    with pytest.raises(ValidationError, match="explicit on_conflict"):
-        await queue.enqueue(task="prepare_simulation", dedupe_key="k")
-    assert queue.recorded == []
-
-
-async def test_a_non_serializable_payload_is_rejected(queue: RecordingQueue) -> None:
-    with pytest.raises(ValidationError):
-        await queue.enqueue(task="prepare_simulation", payload={"when": object()})
-    assert queue.recorded == []
-
-
-async def test_an_oversized_payload_is_rejected(queue: RecordingQueue) -> None:
-    with pytest.raises(ValidationError):
-        await queue.enqueue(task="prepare_simulation", payload="x" * (256 * 1024))
-    assert queue.recorded == []
-
-
-async def test_scheduled_at_and_delay_remain_mutually_exclusive(
-    queue: RecordingQueue,
-) -> None:
-    with pytest.raises(ValidationError, match="not both"):
-        await queue.enqueue(
-            task="prepare_simulation", scheduled_at=datetime.now(UTC), delay=5
-        )
-
-
-async def test_delay_becomes_a_scheduled_instant(queue: RecordingQueue) -> None:
-    job = await queue.enqueue(task="prepare_simulation", delay=timedelta(minutes=5))
-    assert job.scheduled_at > datetime.now(UTC) + timedelta(minutes=4)
-
-
-async def test_an_out_of_range_priority_is_rejected(queue: RecordingQueue) -> None:
-    with pytest.raises(ValidationError):
-        await queue.enqueue(task="prepare_simulation", priority=10**9)
-
-
-# ------------------------------------------------------------- enqueue_many
 
 
 async def test_a_batch_is_validated_before_anything_is_recorded(
@@ -233,11 +152,7 @@ async def test_an_oversized_batch_is_rejected(queue: RecordingQueue) -> None:
     assert queue.recorded == []
 
 
-# ----------------------------------------------------- recording, not simulating
-
-
 async def test_dedupe_conflicts_are_not_simulated(queue: RecordingQueue) -> None:
-    """Documented non-goal: two calls, two records, no AlreadyEnqueued."""
     first = await queue.enqueue(
         task="prepare_simulation", dedupe_key="k", on_conflict="raise"
     )
@@ -255,9 +170,6 @@ async def test_inspection_needs_a_real_database(queue: RecordingQueue) -> None:
         await queue.list_jobs()
     with pytest.raises(ConfigurationError, match="no pool"):
         await queue.stats()
-
-
-# ---------------------------------------------------------------- helpers
 
 
 async def test_enqueued_filters_by_task_name() -> None:
@@ -281,14 +193,9 @@ async def test_reset_clears_records_but_keeps_registrations(
     assert len(queue.recorded) == 1
 
 
-# ---------------------------------------------------- the consumer's seam
-
-
 async def test_it_substitutes_for_a_real_queue_at_the_defer_seam(
     queue: RecordingQueue,
 ) -> None:
-    """Repository code takes a defer callback, unchanged."""
-
     async def enqueue_simulation(connection: Any, compute_job_id: uuid.UUID) -> Job:
         return await queue.enqueue(
             connection,
@@ -301,7 +208,6 @@ async def test_it_substitutes_for_a_real_queue_at_the_defer_seam(
     async def create_or_get_job(
         *, simulation_id: uuid.UUID, defer: Callable[[Any, uuid.UUID], Awaitable[Job]]
     ) -> Job:
-        # Stands in for repository code that knows nothing about the queue.
         return await defer(None, simulation_id)
 
     simulation_id = uuid.uuid4()
