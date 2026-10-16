@@ -47,8 +47,7 @@ if TYPE_CHECKING:
 
 __all__ = ["ConflictMode", "Queue"]
 
-#: What to do when a dedupe key is already held by an active job. The choice
-#: is explicit per call, so there is no default.
+#: What to do when a dedupe key is already held by an active job.
 ConflictMode = Literal["return_existing", "raise"]
 
 
@@ -63,37 +62,8 @@ class _RegistrationOptions:
 class Queue:
     """One named queue, bound to an application-owned asyncpg pool.
 
-    The pool is only used for inspection and administration. Enqueueing always
-    takes a caller-supplied connection so the job lands in the caller's own
-    transaction:
-
-    >>> async with pool.acquire() as connection:          # doctest: +SKIP
-    ...     async with connection.transaction():
-    ...         await app_db.execute(create_compute_job(...))
-    ...         job = await queue.enqueue(
-    ...             connection,
-    ...             task="prepare_simulation",
-    ...             payload={"compute_job_id": str(compute_job_id)},
-    ...             dedupe_key=f"simulation:{external_id}",
-    ...             on_conflict="return_existing",
-    ...         )
-
-    Business code should not import rqueue to do this. Pass it a thin callback,
-    for example as the ``defer`` argument of a repository function::
-
-        async def enqueue_simulation(connection, compute_job_id):
-            return await queue.enqueue(
-                connection,
-                task="prepare_simulation",
-                payload={"compute_job_id": str(compute_job_id)},
-                dedupe_key=f"simulation:{compute_job_id}",
-                on_conflict="return_existing",
-            )
-
-    Fairness: a queue is served by the workers configured for it, and rqueue
-    does not arbitrate between queues -- run one :class:`~rqueue.Worker` per
-    queue and size each one deliberately. Within a queue the order is
-    ``priority`` descending, then ``scheduled_at``, then insertion order.
+    The pool is used only for inspection and administration. Enqueueing takes a
+    caller-supplied connection, so the job lands in the caller's transaction.
     """
 
     def __init__(
@@ -121,8 +91,6 @@ class Queue:
     @property
     def notify_channel(self) -> str:
         return self.storage.notify_channel
-
-    # ------------------------------------------------------------- registry
 
     def declare_task(
         self,
@@ -246,10 +214,8 @@ class Queue:
                 retry=retry,
                 timeout=timeout,
             )
-            # Numeric settings belong to the canonical declaration, while
-            # retry_on/retry_if are registration-time hooks owned by this
-            # worker. Omitted retry settings inherit only the producer's
-            # numeric defaults; an explicit policy is wholly worker-local.
+            # Numeric settings belong to the declaration; retry_on and retry_if
+            # are worker-local hooks. An explicit policy is wholly local.
             registration_retry = (
                 retry
                 if retry is not None
@@ -262,7 +228,7 @@ class Queue:
                 retry=registration_retry,
                 timeout=declaration.timeout,
             )
-        registration = TaskRegistration.from_declaration(
+        registration = TaskRegistration(
             declaration=registration_declaration,
             handler=handler,
             decoder=decoder,
@@ -342,7 +308,7 @@ class Queue:
         )
         if retry == registration.retry and timeout == registration.timeout:
             return
-        self._tasks[name] = TaskRegistration.from_declaration(
+        self._tasks[name] = TaskRegistration(
             declaration=TaskDeclaration(
                 name=name,
                 retry=retry,
@@ -366,8 +332,6 @@ class Queue:
             return self._tasks[name]
         except KeyError:
             raise UnknownTask(f"no handler registered for task {name!r}") from None
-
-    # -------------------------------------------------------------- enqueue
 
     async def enqueue(
         self,
@@ -405,9 +369,8 @@ class Queue:
                 metadata=metadata,
             )
         )
-        # A savepoint, when the caller is already in a transaction: it keeps an
-        # AlreadyEnqueued from poisoning the caller's transaction, and rolls
-        # back the no-op conflict UPDATE that produced it.
+        # A savepoint keeps AlreadyEnqueued from poisoning the caller's
+        # transaction.
         async with connection.transaction():
             job, inserted = await self.storage.insert_job(connection, spec)
             if not inserted and spec.raise_on_conflict:
@@ -487,11 +450,8 @@ class Queue:
             else:
                 max_attempts = policy.max_attempts
         elif max_attempts is None:
-            # The database column is NOT NULL. A plain registration preserves
-            # the old local max-attempts default, while its retry policy stays
-            # NULL so a worker can apply its current local backoff/jitter
-            # settings when it claims the job. A producer-only queue has only
-            # its queue default available here.
+            # The column is NOT NULL. The retry policy stays NULL, so a worker
+            # applies its own backoff when it claims the job.
             max_attempts = (
                 registration.retry.max_attempts
                 if registration is not None
@@ -535,8 +495,6 @@ class Queue:
             ),
             raise_on_conflict=request.on_conflict == "raise",
         )
-
-    # ----------------------------------------------------------- inspection
 
     @asynccontextmanager
     async def connection(self) -> AsyncIterator[asyncpg.Connection]:
