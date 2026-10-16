@@ -119,7 +119,13 @@ components it did not write. A role may delete a heartbeat it wrote even after
 its grants changed, so a scheduler can always take down its own row.
 
 A scheduler records liveness for the queues it schedules. With no enabled
-schedules it records none.
+schedules it records none. Each tick also deletes its heartbeats for queues it
+no longer schedules, so disabling the last schedule on a queue does not leave
+readiness reporting a scheduler there until the staleness window ends. The tick
+asks first, so a scheduler with nothing to delete never needs the `DELETE`
+privilege. When the role lacks it, the scheduler keeps ticking and logs one
+warning for each distinct set of queues. Run `provision_role` again for that
+role to grant it.
 
 ### Tables outside the policies
 
