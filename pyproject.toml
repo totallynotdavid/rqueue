@@ -53,12 +53,10 @@ known-first-party = ["rqueue"]
 [tool.ruff.lint.per-file-ignores]
 # Asserts, dummy credentials, and f-string table names are fine in tests.
 "tests/**/*.py" = ["S101", "S105", "S106", "S311", "S608"]
-# S608 is suppressed in these three modules only. PostgreSQL has no bind
-# parameter for an identifier, so the schema name is interpolated -- after
-# rqueue.limits.validate_identifier has restricted it to [a-z_][a-z0-9_]* and
-# 63 bytes. Every caller-supplied *value* is a $n parameter; role and database
-# identifiers go through PostgreSQL's own format('%I'/'%L'). Enforced by
-# tests/test_storage_sql.py::test_no_statement_uses_string_formatting_for_values.
+# S608 is suppressed in these modules only. PostgreSQL has no bind parameter
+# for an identifier, so the schema name is interpolated after
+# rqueue.limits.validate_identifier restricts it. Values are $n parameters, and
+# role and database identifiers go through format('%I'/'%L').
 "src/rqueue/storage.py" = ["S608"]
 "src/rqueue/migrations/__init__.py" = ["S608"]
 "src/rqueue/roles.py" = ["S608"]

@@ -19,24 +19,7 @@ __all__ = [
 
 @runtime_checkable
 class MetricsSink(Protocol):
-    """Where the worker and scheduler report what they observed.
-
-    The emitted series are:
-
-    ``rqueue.queue.depth``            gauge, jobs pending or leased
-    ``rqueue.queue.ready``            gauge, jobs eligible right now
-    ``rqueue.queue.oldest_ready_age`` gauge, seconds
-    ``rqueue.claim.latency``          timing, seconds for one claim round trip
-    ``rqueue.claim.jobs``             counter, jobs actually leased
-    ``rqueue.handler.duration``       timing, seconds of user code
-    ``rqueue.job.succeeded``          counter
-    ``rqueue.job.retried``            counter
-    ``rqueue.job.failed``             counter
-    ``rqueue.job.cancelled``          counter
-    ``rqueue.lease.expired``          counter, leases recovered by the sweep
-    ``rqueue.wakeup``                 counter, tagged source=notify|poll
-    ``rqueue.schedule.fired``         counter
-    """
+    """Where the worker and scheduler report what they observed."""
 
     def counter(self, name: str, value: int = 1, **fields: Any) -> None: ...
 

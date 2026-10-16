@@ -1,35 +1,12 @@
 """Least-privilege PostgreSQL roles for producers, workers, and schedulers.
 
-Three separations matter here:
+Queue scoping comes from row-level-security policies driven by rows in
+``role_queue_grants``. Queue names reach SQL as bind parameters.
 
-* the **migration role** owns the schema and is the only role that runs DDL;
-* a **producer** may enqueue and read, but not transition or delete anything;
-* a **worker** may claim and transition, but still cannot change the schema.
-
-Queue scoping is enforced by the row-level-security policies installed in
-migrations 0002 and 0005, driven by rows in ``role_queue_grants`` -- so the
-queue names a role may touch arrive as bind parameters, never as interpolated
-SQL.
-
-Two of the separations are enforced by what a capability is *not* given.
-:attr:`Capability.CONSUME` has no ``INSERT`` on ``jobs``, and its ``UPDATE`` is
-limited to the lease and outcome columns. Claiming and transitioning work is
-not the same authority as creating it. A compromised worker that can enqueue or
-rewrite a pending job's ``task`` and ``payload`` can hand itself any task the
-fleet will run.
-:attr:`Capability.PURGE` has no ``DELETE`` on ``jobs`` either -- it gets
-``EXECUTE`` on the ``SECURITY DEFINER`` routine installed by migration 0006,
-which re-derives queue, terminal state, age cutoff, and batch size for itself.
-The routine is the safety boundary; the grant only decides who may ask.
-
-Role and schema names *are* identifiers, and PostgreSQL has no bind parameter
-for an identifier. DDL statements (``CREATE ROLE``, ``GRANT``, ...) are
-assembled server-side with ``format('... %I ... %L', $1, $2)`` and then
-executed, so quoting is done by PostgreSQL itself. The plain DML against
-``role_queue_grants`` interpolates the schema directly instead; that is safe
-only because the schema has already passed
-:func:`~rqueue.limits.validate_identifier`, the same protection
-:mod:`rqueue.storage` relies on.
+DDL statements (``CREATE ROLE``, ``GRANT``, ...) are assembled server-side with
+``format('... %I ... %L', $1, $2)``, because PostgreSQL has no bind parameter
+for an identifier. The DML against ``role_queue_grants`` interpolates the
+schema, which has passed :func:`~rqueue.limits.validate_identifier`.
 """
 
 from __future__ import annotations
@@ -63,18 +40,11 @@ class Capability(enum.StrEnum):
     PURGE = "purge"
 
 
-# (table, privileges) per capability. Deliberately explicit rather than
-# "GRANT ALL ON ALL TABLES": a producer that can DELETE FROM jobs is not a
-# least-privilege producer.
+# (table, privileges) per capability.
 #
-# The producer's ``UPDATE (updated_at)`` on ``jobs`` is column-scoped on
-# purpose. Every enqueue is an ``INSERT ... ON CONFLICT ... DO UPDATE SET
-# updated_at = jobs.updated_at`` (see :meth:`rqueue.storage.Storage.insert_job`
-# for why that no-op update, and not ``DO NOTHING``, is the right conflict
-# path), and PostgreSQL demands UPDATE privilege on every column named in a
-# ``DO UPDATE SET`` -- even one that writes a column back to its own value. A
-# whole-table UPDATE would also let a producer rewrite ``state``, ``payload``,
-# or ``attempt``, which a producer must not be able to do.
+# ``UPDATE (updated_at)`` on ``jobs`` is column-scoped because enqueue is an
+# ``INSERT ... ON CONFLICT DO UPDATE SET updated_at``, and PostgreSQL requires
+# UPDATE on every column that clause names.
 _TABLE_GRANTS: dict[Capability, tuple[tuple[str, str], ...]] = {
     Capability.PRODUCE: (
         ("jobs", "SELECT, INSERT, UPDATE (updated_at)"),
@@ -82,45 +52,29 @@ _TABLE_GRANTS: dict[Capability, tuple[tuple[str, str], ...]] = {
         ("schema_migrations", "SELECT"),
     ),
     Capability.CONSUME: (
-        # No INSERT. Creating work is the producer's authority. UPDATE covers
-        # only the columns the worker's statements write (lease, heartbeat,
-        # outcome, reschedule, ``retry_policy`` quarantine). Left out are what
-        # a job *is* (``task``, ``payload``, ``queue``, keys, limits) and the
-        # operator's ``cancel_requested``, so a worker cannot rewrite a pending
-        # job into different work.
+        # No INSERT, and UPDATE leaves out ``task``, ``payload``, ``queue`` and
+        # ``cancel_requested``, so a worker cannot turn a job into other work.
         (
             "jobs",
             "SELECT, UPDATE (state, attempt, scheduled_at, started_at, "
             "finished_at, worker_id, lease_token, leased_until, heartbeat_at, "
             "error_type, error_message, retry_policy, updated_at)",
         ),
-        # Attempts are opened at claim and closed at the transition. The
-        # identifying columns are written once, by the INSERT.
         (
             "job_attempts",
             "SELECT, INSERT, UPDATE (finished_at, outcome, error_type, error_message)",
         ),
         ("concurrency_slots", "SELECT, INSERT, UPDATE, DELETE"),
         ("runtime_heartbeats", "SELECT, INSERT, UPDATE"),
-        # The claim query reads the pause table on every claim. SELECT only:
-        # pausing a queue is an operator action, not something a worker role
-        # may take.
+        # SELECT only: pausing is an operator action.
         ("queue_pauses", "SELECT"),
         ("schema_migrations", "SELECT"),
     ),
     Capability.SCHEDULE: (
-        # UPDATE is column-scoped for the same reason it is under PRODUCE: an
-        # enqueue is an INSERT ... ON CONFLICT ... DO UPDATE SET updated_at,
-        # and PostgreSQL demands UPDATE on every column that statement names.
-        # A scheduler creates jobs; it does not transition them.
         ("jobs", "SELECT, INSERT, UPDATE (updated_at)"),
         ("schedules", "SELECT, INSERT, UPDATE"),
         ("schedule_occurrences", "SELECT, INSERT"),
-        # DELETE, unlike the worker's grant: a scheduler's set of queues comes
-        # from which schedules are enabled, which an operator changes while it
-        # runs, so each tick retracts the heartbeats for queues it no longer
-        # serves. A worker's queues are fixed when it is constructed and it has
-        # nothing to retract.
+        # DELETE, unlike the worker, so a tick can retract dropped queues.
         ("runtime_heartbeats", "SELECT, INSERT, UPDATE, DELETE"),
         ("schema_migrations", "SELECT"),
     ),
@@ -131,61 +85,43 @@ _TABLE_GRANTS: dict[Capability, tuple[tuple[str, str], ...]] = {
         ("schedules", "SELECT"),
         ("schedule_occurrences", "SELECT"),
         ("queue_pauses", "SELECT"),
-        # Readiness is an inspection: check_readiness reads worker and
-        # scheduler liveness on every probe, and a role that cannot read this
-        # table reports a healthy database as unreachable rather than as
-        # workerless (see :func:`rqueue.health.check_readiness`).
         ("runtime_heartbeats", "SELECT"),
         ("schema_migrations", "SELECT"),
     ),
-    # PURGE reads what it is about to delete and is otherwise powerless
-    # against the table: the deleting is done by _FUNCTION_GRANTS below.
     Capability.PURGE: (
         ("jobs", "SELECT"),
         ("schema_migrations", "SELECT"),
     ),
 }
 
-#: Which runtime component a capability makes a role. A heartbeat names a
-#: `kind`, and the policies on ``runtime_heartbeats`` only accept one the role
-#: is entitled to, so a worker role cannot claim a scheduler is alive
-#: (0008_heartbeat_ownership.sql). A role holding both capabilities claims
-#: both, which is correct: one deployment can be both.
+#: Which runtime component a capability makes a role. The policies on
+#: ``runtime_heartbeats`` accept only a `kind` the role is entitled to.
 _RUNTIME_KINDS: Final[dict[Capability, str]] = {
     Capability.CONSUME: "worker",
     Capability.SCHEDULE: "scheduler",
 }
 
-#: Signature of the purge routine installed by migration 0006. The argument
-#: list is part of the identity of a PostgreSQL function, so it has to be
-#: spelled out to grant on it; it is a module constant rather than a caller's
-#: string, and the schema and role around it are still quoted by ``%I``.
+#: The argument list is part of a PostgreSQL function's identity, so a grant
+#: has to spell it out.
 PURGE_FUNCTION: Final = ("purge_terminal_jobs", "text, text[], timestamptz, integer")
 
-# (function name, argument types) per capability. Kept apart from
-# _TABLE_GRANTS because REVOKE ... ON ALL TABLES does not touch routines: a
-# role repaired without the matching routine revoke would keep an EXECUTE it
-# is no longer entitled to.
+# (function name, argument types) per capability. Separate from _TABLE_GRANTS
+# because REVOKE ... ON ALL TABLES does not touch routines.
 _FUNCTION_GRANTS: dict[Capability, tuple[tuple[str, str], ...]] = {
     Capability.PURGE: (PURGE_FUNCTION,),
 }
 
 #: Role attributes that must not survive provisioning, with the clause that
-#: clears each. PostgreSQL will only let a caller change an attribute it holds
-#: itself -- clearing CREATEDB requires CREATEDB, even when the target does not
-#: have it -- so a repair emits only the clauses it actually needs, and a role
-#: that is genuinely over-privileged for the provisioning connection fails
-#: loudly instead of being quietly left elevated.
+#: clears each. PostgreSQL lets a caller clear only an attribute it holds
+#: itself, so a repair emits only the clauses it needs.
 _ELEVATED_ATTRIBUTES: Final = (
     ("rolsuper", "NOSUPERUSER"),
     ("rolcreatedb", "NOCREATEDB"),
     ("rolcreaterole", "NOCREATEROLE"),
     ("rolbypassrls", "NOBYPASSRLS"),
     ("rolreplication", "NOREPLICATION"),
-    # NOINHERIT is the odd one out: inheritance is PostgreSQL's default, so
-    # this is not repairing drift but refusing a default. A runtime role that
-    # inherits picks up whatever a later membership grants it, silently; with
-    # NOINHERIT a membership is inert until someone deliberately SETs the role.
+    # Refuses a default: with NOINHERIT, a later membership stays inert until
+    # someone SETs the role.
     ("rolinherit", "NOINHERIT"),
 )
 
@@ -226,12 +162,7 @@ def _resolve_privileges(grants: Iterable[str]) -> list[str]:
 async def _ddl(
     connection: asyncpg.Connection, template: str, *args: str | None
 ) -> None:
-    """Build one DDL statement with PostgreSQL's own quoting, then run it.
-
-    The template and every value are bind parameters to ``format()``; the only
-    thing this module ever sends as literal SQL text is the result PostgreSQL
-    itself produced, with ``%I``/``%L`` already quoted.
-    """
+    """Build one DDL statement with PostgreSQL's own quoting, then run it."""
     placeholders = ", ".join(f"${index + 2}::text" for index in range(len(args)))
     statement = await connection.fetchval(
         f"SELECT format($1::text, {placeholders})", template, *args
@@ -240,14 +171,9 @@ async def _ddl(
 
 
 async def _revoke_memberships(connection: asyncpg.Connection, role: str) -> None:
-    """Take back the memberships an existing role has collected.
+    """Take back every membership an existing role holds.
 
-    Attributes are cleared by the ``ALTER ROLE`` in :func:`provision_role`;
-    this is the other half, and it has to happen before the capability grants
-    so that the role a caller inspects afterwards is the role this call
-    actually described. ``provision_role`` grants no memberships of its own, so
-    every membership found here is drift: something a human or another tool
-    added, carrying privileges the capability model never accounted for.
+    ``provision_role`` grants none, so each one is drift.
     """
     inherited = await connection.fetch(
         """
@@ -263,20 +189,9 @@ async def _revoke_memberships(connection: asyncpg.Connection, role: str) -> None
     )
     if not inherited:
         return
-    # GRANTED BY is not decoration, and it is not portable either.
-    #
-    # PostgreSQL 16 made one membership grantable several times by different
-    # roles, each grant its own row with its own options, and made a bare
-    # REVOKE remove only the grant the current role made. A membership someone
-    # else granted survives it -- still inheriting, still carrying whatever the
-    # group holds -- while this function reports the role narrowed. Naming the
-    # grantor is the only way to reach those on 16 and later.
-    #
-    # It is also the release that added the clause. On 14 and 15 it is a syntax
-    # error, and the package supports 14+. Nothing is lost by omitting it there: those
-    # versions record a single grantor per membership, so the bare REVOKE that
-    # is all they accept removes the membership outright, which is exactly the
-    # outcome the clause buys on 16.
+    # From PostgreSQL 16 a membership can be granted by several roles, and a
+    # bare REVOKE removes only the current role's grant. GRANTED BY reaches the
+    # others, but it is a syntax error on 14 and 15, which record one grantor.
     if await _tracks_multiple_grantors(connection):
         for row in inherited:
             await _ddl(
@@ -294,10 +209,7 @@ async def _revoke_memberships(connection: asyncpg.Connection, role: str) -> None
 async def _tracks_multiple_grantors(connection: asyncpg.Connection) -> bool:
     """Whether this server records more than one grantor per membership.
 
-    PostgreSQL 16, which is also the release that accepts ``GRANTED BY`` on a
-    role-membership REVOKE. Asked of the server rather than assumed, because
-    the package supports three major versions and the answer differs across
-    them.
+    That is PostgreSQL 16, the release that accepts ``GRANTED BY`` on REVOKE.
     """
     version: int = await connection.fetchval(
         "SELECT current_setting('server_version_num')::integer"
@@ -308,9 +220,7 @@ async def _tracks_multiple_grantors(connection: asyncpg.Connection) -> bool:
 def _all_attribute_clauses() -> str:
     """Every ``NO...`` clause, for a role being created.
 
-    They are PostgreSQL's own defaults, so stating them costs no privilege, and
-    stating them puts the role's shape in the statement rather than in an
-    assumption about server defaults.
+    They are PostgreSQL's defaults, so stating them needs no privilege.
     """
     return "".join(f" {clause}" for _, clause in _ELEVATED_ATTRIBUTES)
 
@@ -318,13 +228,9 @@ def _all_attribute_clauses() -> str:
 async def _elevated_attribute_clauses(connection: asyncpg.Connection, role: str) -> str:
     """Only the ``NO...`` clauses an existing role actually needs.
 
-    Clearing an attribute requires holding it: ``NOCREATEDB`` from a connection
-    without ``CREATEDB`` is refused even when the target role has no
-    ``CREATEDB`` to lose. Emitting the full set would therefore fail on every
-    ordinary provisioning connection. Emitting only what is set means a role
-    that is genuinely over-privileged for this connection fails loudly, which
-    is the right answer -- a least-privilege role that cannot be made least
-    privilege is not one.
+    Clearing an attribute requires holding it, even when the target role lacks
+    it, so the full set would fail on an ordinary provisioning connection. A
+    role over-privileged for this connection fails loudly.
     """
     current = await connection.fetchrow(
         "SELECT "
@@ -344,14 +250,9 @@ async def _reject_owned_objects(
 ) -> None:
     """Refuse to provision a role that owns anything in the schema.
 
-    Ownership is not a privilege in the ACL, so every ``REVOKE`` in this module
-    passes straight over it. An owner may ``GRANT`` itself anything it likes,
-    and ``ALTER`` or ``DROP`` the object outright -- which makes owning
-    ``jobs`` strictly more powerful than any capability, and makes a role that
-    owns it un-narrowable by definition. Detected here rather than repaired:
-    reassigning objects is a decision about who should hold them, and guessing
-    at that from inside a role-provisioning call could hand a table to whoever
-    happened to run the deployment script.
+    Ownership is not an ACL privilege, so no ``REVOKE`` narrows it. It is
+    refused rather than repaired, because reassigning objects is a decision
+    about who should hold them.
     """
     owned = await connection.fetch(
         """
@@ -364,9 +265,7 @@ async def _reject_owned_objects(
         JOIN pg_namespace AS n ON n.oid = c.relnamespace
         JOIN pg_roles AS r ON r.oid = c.relowner
         WHERE n.nspname = $1 AND r.rolname = $2
-          -- Indexes and identity sequences cannot be owned separately from
-          -- the table they hang off, so naming them would bury the one
-          -- object an operator has to act on under a list of its parts.
+          -- Indexes and identity sequences belong to their table.
           AND NOT EXISTS (
               SELECT 1 FROM pg_depend AS d
               WHERE d.classid = 'pg_class'::regclass
@@ -374,25 +273,10 @@ async def _reject_owned_objects(
                 AND d.deptype IN ('i', 'a')
           )
         UNION ALL
-        -- Everything else in the schema, from one branch rather than a dozen.
-        --
-        -- Routines, types, collations, conversions, operators, operator
-        -- classes and families, text-search dictionaries and configurations,
-        -- extended statistics and extensions each live in their own catalog
-        -- with their own owner column, and every one of them carries the same
-        -- authority: ALTER and DROP on an object in a schema this role is
-        -- never supposed to shape. Enumerating them catalog by catalog means
-        -- the next one PostgreSQL adds is a hole nobody notices, and the
-        -- catalogs ship no common view -- but `pg_shdepend` records one row
-        -- per owned object whatever catalog it lives in, `pg_depend` says
-        -- which schema it is in, and `pg_describe_object` names it the way an
-        -- operator would have to write it in an ALTER.
-        --
-        -- `pg_class` keeps the explicit branch above: a role that owns nothing
-        -- but is PostgreSQL's bootstrap superuser gets no `pg_shdepend` rows
-        -- at all, and relations are the ownership that matters most to catch.
-        -- The schema and database branches below read their catalogs directly
-        -- for the same reason, and neither lives in a schema anyway.
+        -- Every other owned object in the schema, whatever its catalog.
+        -- pg_shdepend has one row per owned object, so a new object kind
+        -- needs no new branch. The bootstrap superuser has no rows there,
+        -- which is why relations, schemas and databases are read directly.
         SELECT pg_describe_object(dep.classid, dep.objid, 0)
         FROM pg_shdepend AS dep
         JOIN pg_roles AS r ON r.oid = dep.refobjid
@@ -449,32 +333,16 @@ async def provision_role(
 ) -> None:
     """Create or repair one scoped role.
 
-    Re-running this repairs a role that has drifted: the revokes come first, so
-    an over-granted role is narrowed back to exactly the capabilities asked for
-    here. It never grants DDL -- schema ownership stays with the migration role.
+    Re-running repairs a role that has drifted: the revokes come first, so the
+    role ends with exactly the capabilities asked for. It never grants DDL.
 
-    A role that *owns* an object in the schema, the schema itself, or the
-    database is refused outright: ownership sits above the ACL this function
-    edits, so an owner can re-grant itself anything the moment it is narrowed.
+    A role that owns an object in the schema, the schema itself, or the
+    database is refused. The role is set ``NOSUPERUSER NOCREATEDB NOCREATEROLE
+    NOBYPASSRLS NOREPLICATION NOINHERIT`` and loses every membership. A
+    connection that cannot clear an attribute the role holds raises.
 
-    Every failure leaves the role as it was, not only that one. The whole body
-    runs in one transaction, so a call that raises part way through has written
-    nothing -- the alternative is a role that exists and can log in carrying
-    whichever half of a capability set got applied before the error, which is
-    the state a caller reading the exception would least expect to find.
-
-    Repair covers the privileges that live outside the schema's grant tables
-    too. The role is set ``NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS
-    NOREPLICATION NOINHERIT`` and every role membership it holds is revoked,
-    before any capability grant is applied. Without that, "repair" would mean
-    only that the *table* grants are right, while a ``BYPASSRLS`` role reads
-    every queue in the database and a ``SUPERUSER`` role ignores the model
-    entirely -- a least-privilege promise this function could not keep.
-
-    There is no way to ask for less. A connection that cannot clear an
-    attribute the role holds raises rather than returning a role that is only
-    partly narrowed, because the caller's next act is to hand out that role's
-    credentials.
+    The whole body runs in one transaction, so a failure leaves the role as it
+    was.
     """
     role = validate_identifier(role, kind="role name")
     schema = validate_identifier(schema, kind="schema")
@@ -484,22 +352,12 @@ async def provision_role(
     if not queues:
         raise ValidationError("a role needs at least one queue grant")
 
-    # One transaction for the whole body. Role DDL is transactional in
-    # PostgreSQL, so a failure at any step -- a PURGE grant against a schema
-    # whose migrations stop short of the routine is the realistic one --
-    # takes the role back to exactly what it was. Without it the failure
-    # leaves a role that exists, can log in, and holds part of a capability
-    # set nobody asked for: the half-narrowed state this function promises
-    # never to produce.
     async with connection.transaction():
         exists = bool(
             await connection.fetchval("SELECT 1 FROM pg_roles WHERE rolname = $1", role)
         )
         dbname: str = database or await connection.fetchval("SELECT current_database()")
         if exists:
-            # First, even so: the transaction would undo a later refusal, but
-            # this one is a decision about the role rather than a failure, and
-            # it costs nothing to reach before any statement is issued.
             await _reject_owned_objects(
                 connection, role, schema=schema, database=dbname
             )
@@ -530,22 +388,14 @@ async def provision_role(
             schema,
             role,
         )
-        # Routines are a separate privilege class: the table revoke above leaves
-        # EXECUTE untouched, so a role that once held PURGE would keep reaching the
-        # purge routine after being re-provisioned without it.
+        # ALL TABLES reaches neither routines nor sequences.
         await _ddl(
             connection,
             "REVOKE ALL PRIVILEGES ON ALL ROUTINES IN SCHEMA %I FROM %I",
             schema,
             role,
         )
-        # Sequences are a third, and the one an audit of table grants misses.
-        # `jobs.seq` and `job_attempts.id` are GENERATED ALWAYS AS IDENTITY,
-        # which is a sequence object of its own in the privilege system --
-        # ALL TABLES does not reach it. UPDATE on one is `setval`, and
-        # `jobs.seq` is the claim order's tiebreaker, so a privilege left
-        # behind here hands out duplicate sequence values to a role this
-        # function has just reported as narrowed.
+        # UPDATE on `jobs.seq`, the claim order's tiebreaker, is `setval`.
         await _ddl(
             connection,
             "REVOKE ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA %I FROM %I",
@@ -554,8 +404,7 @@ async def provision_role(
         )
         await _ddl(connection, "GRANT CONNECT ON DATABASE %I TO %I", dbname, role)
         await _ddl(connection, "GRANT USAGE ON SCHEMA %I TO %I", schema, role)
-        # The RLS policies read this table as the querying role, so the role must
-        # be able to see its own grants.
+        # The RLS policies read this table as the querying role.
         await _ddl(
             connection,
             "GRANT SELECT ON %I.role_queue_grants TO %I",
@@ -603,8 +452,7 @@ async def _set_runtime_kinds(
 ) -> None:
     """Record the component kinds this role may claim liveness as.
 
-    Replaced wholesale, like the queue grants: re-provisioning narrows a role,
-    so a capability dropped from the call has to take its kind with it.
+    Replaced wholesale, like the queue grants.
     """
     await connection.execute(
         f"DELETE FROM {schema}.role_runtime_kinds WHERE role_name = $1", role
@@ -674,9 +522,6 @@ async def revoke_role(
         schema,
         role,
     )
-    # The identity sequences behind `jobs.seq` and `job_attempts.id`: separate
-    # objects that ALL TABLES does not reach, and this function promises to
-    # leave nothing.
     await _ddl(
         connection,
         "REVOKE ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA %I FROM %I",

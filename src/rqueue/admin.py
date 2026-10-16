@@ -1,8 +1,6 @@
-"""Inspection and administration operations.
+"""Inspection and administration for operators and maintenance jobs.
 
-These are deliberately outside :class:`~rqueue.context.TaskContext`: a handler
-cannot retry, cancel, or purge anything. They are for operators, admin
-endpoints, and maintenance jobs.
+:class:`~rqueue.context.TaskContext` does not expose these to a handler.
 """
 
 from __future__ import annotations
@@ -33,8 +31,6 @@ class Admin:
     def schema(self) -> str:
         return self.storage.schema
 
-    # ----------------------------------------------------------- inspection
-
     async def get_job(self, job_id: uuid.UUID) -> Job | None:
         async with self.pool.acquire() as connection:
             return await self.storage.get_job(connection, job_id)
@@ -48,11 +44,7 @@ class Admin:
         limit: int = 100,
         offset: int = 0,
     ) -> list[Job]:
-        """List jobs, newest first.
-
-        ``queue`` filters to one queue; ``None`` and ``'*'`` both mean every
-        queue because listing does not mutate queue state.
-        """
+        """List jobs, newest first. ``None`` and ``'*'`` both mean every queue."""
         async with self.pool.acquire() as connection:
             return await self.storage.list_jobs(
                 connection,
@@ -74,16 +66,8 @@ class Admin:
         async with self.pool.acquire() as connection:
             return await self.storage.stats(connection, queue=target)
 
-    # --------------------------------------------------------- state changes
-
     async def cancel_job(self, job_id: uuid.UUID) -> Job:
-        """Cancel a job.
-
-        A pending job is cancelled outright and will never run. A leased job is
-        only *asked* to stop: its worker cancels the handler on the next
-        heartbeat and finalizes the job, or lease expiry does if the worker is
-        gone.
-        """
+        """Cancel a pending job, or ask a leased job's worker to stop it."""
         async with self.pool.acquire() as connection:
             return await self.storage.cancel(connection, job_id)
 
@@ -94,15 +78,7 @@ class Admin:
         scheduled_at: datetime | None = None,
         additional_attempts: int = 1,
     ) -> Job:
-        """Make a terminal job runnable again.
-
-        This is the operator retry path.
-
-        This is the only path out of a terminal state. The attempt counter keeps
-        counting rather than resetting, so the immutable attempt history stays
-        coherent; the fresh budget comes from raising ``max_attempts`` by
-        ``additional_attempts``.
-        """
+        """Make a terminal job runnable again by raising ``max_attempts``."""
         async with self.pool.acquire() as connection:
             return await self.storage.retry_terminal(
                 connection,
@@ -122,24 +98,8 @@ class Admin:
     ) -> int:
         """Delete terminal jobs that finished longer ago than ``retention``.
 
-        ``queue`` is required. A queue name purges that queue and ``'*'``
-        purges every queue, as it does for pause, resume and role grants.
-        ``None`` raises :class:`~rqueue.ValidationError`: a delete across the
-        schema has to be written out, not reached by leaving an argument off.
-
-        Attempt records and occurrence rows are removed with their job by
-        ``ON DELETE CASCADE``, so retention has one knob rather than three.
-
-        The delete itself is done by the ``purge_terminal_jobs`` routine, which
-        re-derives every bound for itself, so this is the operation
-        :attr:`~rqueue.Capability.PURGE` authorizes -- a role holding it has no
-        ``DELETE`` on ``jobs`` and does not need one. Naming a queue is the
-        cheaper call; ``'*'`` purges each queue that has anything to purge,
-        spending ``limit`` across them as a single budget.
-
-        Only terminal states may be named. Asking for a live one raises rather
-        than quietly matching nothing, because a caller that asked for the
-        wrong thing should learn that it did.
+        ``queue`` is required, and ``None`` raises
+        :class:`~rqueue.ValidationError`. Naming a live state raises too.
         """
         cutoff = (now or datetime.now(UTC)) - retention
         state_values = (
@@ -158,17 +118,8 @@ class Admin:
                 limit=limit,
             )
 
-    # ------------------------------------------------------------ queue pause
-
     async def pause_queue(self, name: str) -> QueuePause:
-        """Stop a queue admitting new work, durably and fleet-wide.
-
-        ``name='*'`` pauses every queue. Unlike :meth:`rqueue.Worker.stop`,
-        which ends one worker instance, this is a row every worker's claim
-        query reads, so it applies to replicas that have never heard of this
-        call and survives a restart of all of them. It does not touch work
-        already leased: an in-flight attempt runs to its normal end.
-        """
+        """Stop a queue admitting new work on every worker. ``'*'`` is every queue."""
         target = validate_queue_target(name)
         async with self.pool.acquire() as connection:
             return await self.storage.pause_queue(connection, queue=target)
@@ -176,15 +127,8 @@ class Admin:
     async def resume_queue(self, name: str) -> list[str]:
         """Let a queue admit work again, and return the queues resumed.
 
-        Resuming takes effect on the next claim, not on the next poll: the
-        pause lives in the claim query, so there is no per-worker state to
-        catch up. The NOTIFY this write fires only saves an *idle* worker the
-        rest of its poll interval.
-
-        ``name='*'`` resumes everything, including queues paused by name --
-        a "resume all" that silently left some queues paused would be a trap.
-        Resuming one queue by name, in contrast, does not lift a wildcard
-        pause: the narrower call cannot punch a hole in the broader one.
+        ``'*'`` also resumes queues paused by name. Resuming one queue by name
+        does not lift a wildcard pause.
         """
         target = validate_queue_target(name)
         async with self.pool.acquire() as connection:
@@ -200,8 +144,6 @@ class Admin:
         target = validate_queue_target(name)
         async with self.pool.acquire() as connection:
             return await self.storage.is_queue_paused(connection, queue=target)
-
-    # -------------------------------------------------------------- schedules
 
     async def list_schedules(self, *, enabled_only: bool = False) -> list[Schedule]:
         async with self.pool.acquire() as connection:

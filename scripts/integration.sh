@@ -12,9 +12,7 @@ database_name="rqueue_integration_$(date +%s)_$$"
 app_role="${database_name}_role"
 app_password="rqueue-integration-test-password"
 
-# Anything after the flags is passed through to pytest, so a single test file
-# can be run in a loop during development:
-#   bash scripts/integration.sh tests/integration/test_master_pipeline.py
+# Arguments are passed through to pytest.
 pytest_args=()
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -57,8 +55,7 @@ app_url="$(
         --password "$app_password"
 )"
 
-# Schema changes run with the database-owner connection. The app role below is
-# deliberately limited to runtime DML on one queue.
+# Migrations run as the database owner. The app role is limited to one queue.
 uv run rqueue --database-url "$admin_url" migrate
 
 RQUEUE_ROLE_PASSWORD="$app_password" \

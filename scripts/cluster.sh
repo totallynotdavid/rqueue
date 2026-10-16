@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # cluster.sh start|url|stop <data_dir> [port]
 #
-# Each cluster uses its own data directory and TCP port, so clusters do not
-# collide. `start` records an automatically chosen port for later restarts.
+# Each cluster has its own data directory and TCP port. `start` records a
+# chosen port for later restarts.
 # The server uses TCP only.
 set -euo pipefail
 

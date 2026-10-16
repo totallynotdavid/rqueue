@@ -1,10 +1,9 @@
 """Resource bounds and the validators that enforce them.
 
 A bound on a persisted column is mirrored as a CHECK constraint in the
-migrations, so a direct SQL writer cannot get past it either. Bounds on
-runtime behaviour, such as concurrency, batch size, and lease duration, exist
-only here, since they never reach a column. Either way, the Python side turns
-a violation into a typed error before a statement is ever sent.
+migrations. Bounds on runtime behaviour, such as concurrency, batch size, and
+lease duration, exist only here. A violation is a typed error before any
+statement is sent.
 """
 
 from __future__ import annotations
@@ -17,12 +16,6 @@ from typing import Any, Final
 
 from rqueue.errors import ValidationError
 
-#: Every bound and validator in this module is part of its public surface:
-#: the bounds are what a caller sizes a batch or a payload against, and the
-#: validators are what turns a violation into a typed error. Listed in full
-#: rather than by what the package itself happens to import today -- an
-#: `__all__` that trails the imports is one the package's own modules reach
-#: around, which is how this one had drifted to a third of the module.
 __all__ = [
     "MAX_ATTEMPTS_LIMIT",
     "MAX_BATCH_SIZE",
@@ -71,10 +64,8 @@ MAX_TASK_NAME_LENGTH: Final = 128
 MAX_QUEUE_NAME_LENGTH: Final = 64
 MAX_WORKER_ID_LENGTH: Final = 128
 MAX_DEDUPE_KEY_LENGTH: Final = 256
-#: Largest batch one purge call may delete. Mirrored by the bound the
-#: ``purge_terminal_jobs`` routine enforces for itself (migration 0006),
-#: which is the boundary that actually holds -- this only turns an
-#: out-of-range argument into a typed error before the statement is sent.
+#: Largest batch one purge call may delete. The ``purge_terminal_jobs``
+#: routine enforces the same bound for itself.
 MAX_PURGE_LIMIT: Final = 100_000
 MAX_CONCURRENCY_KEY_LENGTH: Final = 256
 MAX_SCHEDULE_NAME_LENGTH: Final = 128
@@ -90,21 +81,18 @@ MAX_ENQUEUE_BATCH: Final = 1000
 MAX_CONCURRENCY: Final = 1024
 MIN_PRIORITY: Final = -32768
 MAX_PRIORITY: Final = 32767
-#: Bounds on a lease, in seconds. Sub-second leases are allowed so tests can
-#: drive real expiry without sleeping for a wall-clock minute.
+#: Bounds on a lease, in seconds. Sub-second leases let tests drive expiry.
 MIN_LEASE_SECONDS: Final = 0.1
 MAX_LEASE_SECONDS: Final = 24 * 3600.0
 
-# PostgreSQL folds unquoted identifiers to lower case; requiring that shape up
-# front means the schema name we interpolate is byte-identical to the one
-# PostgreSQL stores, and cannot carry a quote or a dot.
+# PostgreSQL folds unquoted identifiers to lower case. This shape keeps an
+# interpolated schema name identical to the stored one, with no quote or dot.
 _IDENTIFIER_RE: Final = re.compile(r"^[a-z_][a-z0-9_]*$")
 _MAX_IDENTIFIER_LENGTH: Final = 63
 
 _NAME_RE: Final = re.compile(r"^[A-Za-z0-9_.:\-]+$")
 
-#: Stands for "every queue" in the operations that accept one. It is outside
-#: ``_NAME_RE`` on purpose, so no real queue can ever be named it.
+#: Stands for "every queue". It is outside ``_NAME_RE``, so no queue is named it.
 QUEUE_WILDCARD: Final = "*"
 
 

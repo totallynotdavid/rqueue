@@ -20,8 +20,7 @@ from rqueue.errors import ValidationError
 
 __all__ = ["CronExpression", "resolve_timezone"]
 
-# Deliberately generous: 8 years covers the worst realistic gap, which is
-# "Feb 29 in a century year that is not a leap year" (1896 -> 1904).
+# 8 years covers the longest gap between Feb 29 dates (1896 -> 1904).
 _MAX_DAY_SCAN: Final = 366 * 8
 
 _MONTH_NAMES: Final = {
