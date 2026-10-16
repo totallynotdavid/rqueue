@@ -65,13 +65,15 @@ def test_names_reject_control_characters() -> None:
 
 
 def test_the_queue_wildcard_is_not_a_name_a_queue_could_take() -> None:
-    """Pause targets accept '*'; nothing else may, so the two never collide."""
+    """'*' is every queue as a target and is never a queue name."""
     assert validate_queue_target(QUEUE_WILDCARD) == "*"
     assert validate_queue_target("compute") == "compute"
     with pytest.raises(ValidationError):
         validate_name(QUEUE_WILDCARD, kind="queue name", max_length=64)
     with pytest.raises(ValidationError):
         validate_queue_target("com*pute")
+    with pytest.raises(ValidationError):
+        validate_queue_target(None)  # type: ignore[arg-type]
 
 
 def test_keys_carry_application_data_but_stay_bounded() -> None:
@@ -100,10 +102,3 @@ def test_error_text_is_truncated_not_rejected() -> None:
     assert truncated.endswith("...")
     assert truncate(None, 10) is None
     assert truncate("a\x00b", 10) == "ab"
-
-
-def test_the_wildcard_is_refused_as_a_name_but_not_as_a_target() -> None:
-    """Purge takes the target form, so '*' is every queue and None is an error."""
-    assert validate_queue_target("*") == QUEUE_WILDCARD
-    with pytest.raises(ValidationError):
-        validate_queue_target(None)  # type: ignore[arg-type]

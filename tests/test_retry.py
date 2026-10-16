@@ -81,17 +81,25 @@ def test_next_attempt_at_is_in_the_future() -> None:
     assert policy.next_attempt_at(1, now=now) == now.replace(second=5)
 
 
-def test_attempt_budget_is_the_authority() -> None:
-    policy = RetryPolicy(max_attempts=3)
-    assert policy.should_retry(RuntimeError(), attempt=2)
-    assert not policy.should_retry(RuntimeError(), attempt=3)
-    assert not policy.should_retry(RuntimeError(), attempt=4)
-
-
-def test_job_attempt_budget_can_override_the_registered_policy() -> None:
-    policy = RetryPolicy(max_attempts=5)
-    assert not policy.should_retry(RuntimeError(), attempt=1, max_attempts=1)
-    assert policy.should_retry(RuntimeError(), attempt=1, max_attempts=2)
+@pytest.mark.parametrize(
+    ("policy_attempts", "job_attempts", "attempt", "expected"),
+    [
+        (3, None, 2, True),
+        (3, None, 3, False),
+        (3, None, 4, False),
+        (5, 1, 1, False),
+        (5, 2, 1, True),
+    ],
+)
+def test_attempt_budget_is_the_authority(
+    policy_attempts: int, job_attempts: int | None, attempt: int, expected: bool
+) -> None:
+    """A job's own budget overrides the registered policy's."""
+    policy = RetryPolicy(max_attempts=policy_attempts)
+    assert (
+        policy.should_retry(RuntimeError(), attempt=attempt, max_attempts=job_attempts)
+        is expected
+    )
 
 
 def test_permanent_failure_is_never_retried() -> None:

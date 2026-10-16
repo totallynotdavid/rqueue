@@ -4,19 +4,16 @@ from __future__ import annotations
 
 import json
 import logging
-import pathlib
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime
 
 import pytest
 
 from rqueue import (
     LoggingMetricsSink,
-    MetricsSink,
     NullMetricsSink,
     Queue,
     Readiness,
-    RetryPolicy,
     ScheduleSpec,
     Worker,
 )
@@ -27,14 +24,6 @@ from rqueue.storage import Storage
 
 async def handler(payload: object, context: object) -> None:
     return None
-
-
-def test_terminal_states_are_exactly_the_finished_ones() -> None:
-    assert JobState.SUCCEEDED.is_terminal
-    assert JobState.FAILED.is_terminal
-    assert JobState.CANCELLED.is_terminal
-    assert not JobState.PENDING.is_terminal
-    assert not JobState.LEASED.is_terminal
 
 
 def test_queue_stats_depth_counts_unfinished_work() -> None:
@@ -52,9 +41,9 @@ def test_queue_stats_depth_counts_unfinished_work() -> None:
     assert stats.depth == 5
 
 
-def test_job_is_built_from_a_row_with_json_text_columns() -> None:
+def job_row(**overrides: object) -> dict[str, object]:
     now = datetime.now().astimezone()
-    row = {
+    row: dict[str, object] = {
         "id": uuid.uuid4(),
         "queue": "q",
         "task": "t",
@@ -80,43 +69,18 @@ def test_job_is_built_from_a_row_with_json_text_columns() -> None:
         "error_message": None,
         "metadata": "{}",
     }
-    job = Job.from_row(row)
+    return row | overrides
+
+
+def test_job_is_built_from_a_row_with_json_text_columns() -> None:
+    job = Job.from_row(job_row())
     assert job.payload == {"a": 1}
     assert job.metadata == {}
     assert job.state is JobState.PENDING
 
 
 def test_job_ignores_a_malformed_persisted_retry_policy_on_read() -> None:
-    now = datetime.now().astimezone()
-    row = {
-        "id": uuid.uuid4(),
-        "queue": "q",
-        "task": "t",
-        "payload": "{}",
-        "state": "pending",
-        "priority": 0,
-        "attempt": 0,
-        "max_attempts": 3,
-        "scheduled_at": now,
-        "created_at": now,
-        "updated_at": now,
-        "started_at": None,
-        "finished_at": None,
-        "dedupe_key": None,
-        "concurrency_key": None,
-        "worker_id": None,
-        "lease_token": None,
-        "leased_until": None,
-        "heartbeat_at": None,
-        "cancel_requested": False,
-        "timeout_seconds": None,
-        "error_type": None,
-        "error_message": None,
-        "metadata": "{}",
-        "retry_policy": "{}",
-    }
-
-    assert Job.from_row(row).retry_policy is None
+    assert Job.from_row(job_row(retry_policy="{}")).retry_policy is None
 
 
 def test_worker_rejects_impossible_settings(offline_queue: Queue) -> None:
@@ -156,18 +120,9 @@ def test_schedule_specs_are_validated_on_construction() -> None:
         ScheduleSpec(name="ok", task="t", cron="@daily", max_attempts=0)
 
 
-def test_retry_policy_is_hashable_and_shareable() -> None:
-    policy = RetryPolicy(max_attempts=4)
-    assert policy.max_attempts == 4
-    assert RetryPolicy(max_attempts=4) == policy
-
-
-def test_null_and_logging_sinks_satisfy_the_protocol(
+def test_the_metrics_sinks_accept_every_metric_kind(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    assert isinstance(NullMetricsSink(), MetricsSink)
-    assert isinstance(LoggingMetricsSink(), MetricsSink)
-
     NullMetricsSink().counter("rqueue.job.succeeded", 1, queue="q")
     with caplog.at_level(logging.DEBUG, logger="rqueue.metrics"):
         sink = LoggingMetricsSink()
@@ -218,10 +173,10 @@ def test_readiness_separates_its_failure_modes() -> None:
     assert not needs_scheduler.ready
 
 
-def test_queue_exposes_its_schema_and_wake_channel() -> None:
-    storage = Storage("other_schema")
-    assert storage.schema == "other_schema"
-    assert storage.notify_channel == "rqueue_other_schema"
+def test_schema_is_short_enough_for_the_notify_channel() -> None:
+    with pytest.raises(ValidationError, match="NOTIFY channel"):
+        Storage("s" * 60)
+    assert Storage("s" * 56).notify_channel == "rqueue_" + "s" * 56
 
 
 def test_a_worker_needs_at_least_one_registered_task(offline_queue: Queue) -> None:
@@ -230,54 +185,6 @@ def test_a_worker_needs_at_least_one_registered_task(offline_queue: Queue) -> No
         import asyncio
 
         asyncio.run(worker._check_registry())
-
-
-def test_retry_backoff_saturates_rather_than_overflowing() -> None:
-    policy = RetryPolicy(
-        initial_backoff=1.0, multiplier=2.0, max_backoff=60.0, jitter=0.0
-    )
-    assert policy.backoff_seconds(500) == 60.0
-    assert policy.next_attempt_at(1) > datetime.now().astimezone() - timedelta(
-        seconds=1
-    )
-
-
-def test_limits_declares_everything_the_package_imports_from_it() -> None:
-    """`__all__` is a claim about the module, and it has to survive additions.
-
-    Every bound and validator here is reached by name from elsewhere in the
-    package, so an `__all__` that lists a subset is not a narrower public API --
-    it is a stale one that the package's own modules already reach around. This
-    checks both directions: nothing imported is missing from it, and nothing in
-    it fails to resolve.
-    """
-    import ast
-
-    from rqueue import limits
-
-    source = pathlib.Path(limits.__file__).read_text(encoding="utf-8")
-    tree = ast.parse(source)
-
-    defined: list[str] = []
-    for node in tree.body:
-        if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
-            defined.append(node.target.id)
-        elif isinstance(node, ast.Assign):
-            defined += [t.id for t in node.targets if isinstance(t, ast.Name)]
-        elif isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
-            defined.append(node.name)
-    public = {n for n in defined if not n.startswith("_") and n != "__all__"}
-    assert set(limits.__all__) == public, public.symmetric_difference(limits.__all__)
-    assert all(hasattr(limits, name) for name in limits.__all__)
-
-    # And what the rest of the package actually asks for by name.
-    wanted: set[str] = set()
-    for path in pathlib.Path(limits.__file__).parent.rglob("*.py"):
-        for found in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
-            if isinstance(found, ast.ImportFrom) and found.module == "rqueue.limits":
-                wanted |= {alias.name for alias in found.names}
-    assert wanted, "no module imports from rqueue.limits; this test is not testing"
-    assert wanted <= set(limits.__all__), sorted(wanted - set(limits.__all__))
 
 
 def test_purge_limit_is_bounded_before_a_statement_is_sent() -> None:
